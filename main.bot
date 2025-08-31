@@ -121,6 +121,21 @@ async def get_coinex_signature(method, path, timestamp, params_str=""):
 
 
 # --- Price Fetching ---
+async def get_all_binance_prices():
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{BINANCE_API}/api/v3/ticker/price") as r:
+            data = await r.json()
+            prices = {}
+            for item in data:
+                sym = item.get('symbol', '')
+                try:
+                    price = float(item.get('price', '0'))
+                except (TypeError, ValueError):
+                    continue
+                prices[sym] = price
+            return prices
+
+
 async def fetch_prices():
     try:
         async with aiohttp.ClientSession() as session:
@@ -190,7 +205,7 @@ async def fetch_binance_balance():
                 futures_data = await response.json()
 
             # Prices
-            prices = await fetch_prices()
+            prices = await get_all_binance_prices()
 
             message = "Binance Balance:\n\n"
             message += "Spot:\n"
@@ -229,9 +244,9 @@ async def fetch_binance_balance():
                     if balance['symbol'] == 'USDT':
                         message += f"{balance['symbol']}: {balance['amount']:,.2f}\n"
                     else:
-                        message += f"{balance['symbol']}: {balance['amount']:,.8f} (≈ {balance['usdt']:,.2f} USDT)\n"
+                        message += f"{balance['symbol']}: {balance['amount']:,.8f} (≈ ${balance['usdt']:,.2f})\n"
 
-            message += f"\nTotal Spot: {total_spot_usdt:,.2f} USDT\n"
+            message += f"\nTotal Spot: ${total_spot_usdt:,.2f}\n"
 
             # Process futures balance
             message += "\nFutures:\n"
@@ -254,10 +269,10 @@ async def fetch_binance_balance():
 
                 futures_balances.sort(key=lambda x: x['usdt'], reverse=True)
                 for balance in futures_balances:
-                    message += f"{balance['symbol']}: {balance['amount']:,.2f}\n"
+                    message += f"{balance['symbol']}: ${balance['amount']:,.2f}\n"
 
-            message += f"\nTotal Futures: {total_futures_usdt:,.2f} USDT\n"
-            message += f"\nTotal: {(total_spot_usdt + total_futures_usdt):,.2f} USDT"
+            message += f"\nTotal Futures: ${total_futures_usdt:,.2f}\n"
+            message += f"\nTotal: ${(total_spot_usdt + total_futures_usdt):,.2f}"
 
             return message
 
@@ -349,8 +364,9 @@ async def fetch_bybit_balance():
                                     coin_value = float(coin.get('usdValue', '0'))
                                     message += f"{coin_name}: {coin_balance:,.8f}"
                                     if coin_name != 'USDT':
-                                        message += f" (≈ {coin_value:,.2f} USDT)"
-                                    message += "\n"
+                                        message += f" (≈ ${coin_value:,.2f})\n"
+                                    else:
+                                        message += "\n"
                 else:
                     error_msg = data.get('retMsg', 'Unknown error')
                     message += f"Error: {error_msg}"
@@ -483,8 +499,9 @@ async def fetch_coinex_balance():
 
                         message += f"{coin}: {total:.8f}"
                         if usdt_value > 0:
-                            message += f" (≈ ${usdt_value:.2f})"
-                        message += "\n"
+                            message += f" (≈ ${usdt_value:.2f})\n"
+                        else:
+                            message += "\n"
 
                 message += f"\nTotal Balance: ${total_usdt:.2f}"
                 return message
