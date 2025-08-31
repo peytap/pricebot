@@ -1,0 +1,951 @@
+import os
+import time
+import hmac
+import hashlib
+import json
+import aiohttp
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
+from dotenv import load_dotenv
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ALLOWED_USERS = [int(user_id.strip()) for user_id in os.getenv("ALLOWED_USER_ID", "0").split(",")]
+BINANCE_API = "https://api.binance.com"
+BINANCE_FUTURES_API = "https://fapi.binance.com"
+BYBIT_API = "https://api.bybit.com"
+WALLEX_API = "https://api.wallex.ir/v1"
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_SECRET_KEY = os.getenv("BYBIT_SECRET_KEY")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+
+# Основное меню
+main_keyboard = InlineKeyboardMarkup(row_width=3)
+main_keyboard.add(
+    InlineKeyboardButton("rate", callback_data="get_prices"),
+    InlineKeyboardButton("Binance", callback_data="binance_menu"),
+    InlineKeyboardButton("Bybit", callback_data="bybit_menu"),
+    InlineKeyboardButton("CoinEx", callback_data="coinex_menu")
+)
+# کیبورد منوی بایننس
+binance_keyboard = InlineKeyboardMarkup(row_width=2)
+binance_keyboard.add(
+    InlineKeyboardButton("موجودی", callback_data="binance_balance"),
+    InlineKeyboardButton("پوزیشن‌ها", callback_data="binance_positions")
+)
+binance_keyboard.add(InlineKeyboardButton("منوی اصلی", callback_data="main_menu"))
+
+# کیبورد منوی بایبیت
+bybit_keyboard = InlineKeyboardMarkup(row_width=2)
+bybit_keyboard.add(
+    InlineKeyboardButton("موجودی", callback_data="bybit_balance"),
+    InlineKeyboardButton("پوزیشن‌ها", callback_data="bybit_positions")
+)
+bybit_keyboard.add(InlineKeyboardButton("منوی اصلی", callback_data="main_menu"))
+
+# کیبورد مدیریت پوزیشن بایننس
+async def get_binance_position_keyboard(symbol, position_index):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    base_data = f"binance_position_{position_index}"
+    
+    keyboard.add(
+        InlineKeyboardButton("TP", callback_data=f"{base_data}_set_tp"),
+        InlineKeyboardButton("SL", callback_data=f"{base_data}_set_sl")
+    )
+    keyboard.add(
+        InlineKeyboardButton("بستن کامل", callback_data=f"{base_data}_close_100"),
+        InlineKeyboardButton("بستن 75%", callback_data=f"{base_data}_close_75")
+    )
+    keyboard.add(
+        InlineKeyboardButton("بستن 50%", callback_data=f"{base_data}_close_50"),
+        InlineKeyboardButton("بستن 25%", callback_data=f"{base_data}_close_25")
+    )
+    keyboard.add(
+        InlineKeyboardButton("تغییر لوریج", callback_data=f"{base_data}_change_leverage"),
+        InlineKeyboardButton("تغییر سایز", callback_data=f"{base_data}_change_size")
+    )
+    keyboard.add(InlineKeyboardButton("منوی اصلی", callback_data="main_menu"))
+    
+    return keyboard
+
+# کیبورد مدیریت پوزیشن بایبیت
+async def get_bybit_position_keyboard(symbol, position_index):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    base_data = f"bybit_position_{position_index}"
+    
+    keyboard.add(
+        InlineKeyboardButton("TP", callback_data=f"{base_data}_set_tp"),
+        InlineKeyboardButton("SL", callback_data=f"{base_data}_set_sl")
+    )
+    keyboard.add(
+        InlineKeyboardButton("Close 100%", callback_data=f"{base_data}_close_100"),
+        InlineKeyboardButton("Close 75%", callback_data=f"{base_data}_close_75")
+    )
+    keyboard.add(
+        InlineKeyboardButton("Close 50%", callback_data=f"{base_data}_close_50"),
+        InlineKeyboardButton("Close 25%", callback_data=f"{base_data}_close_25")
+    )
+    keyboard.add(
+        InlineKeyboardButton("Leverage", callback_data=f"{base_data}_change_leverage"),
+        InlineKeyboardButton("Size", callback_data=f"{base_data}_change_size")
+    )
+    keyboard.add(InlineKeyboardButton("Main Menu", callback_data="main_menu"))
+    
+    return keyboard
+
+async def get_binance_signature(query_string):
+    return hmac.new(
+        BINANCE_SECRET_KEY.encode('utf-8'),
+        query_string.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+async def get_bybit_signature(params):
+    timestamp = str(int(time.time() * 1000))
+    param_str = '&'.join([f'{key}={value}' for key, value in sorted(params.items())])
+    to_sign = str(timestamp) + BYBIT_API_KEY + '5000' + param_str
+    
+    signature = hmac.new(
+        bytes(BYBIT_SECRET_KEY, 'utf-8'),
+        bytes(to_sign, 'utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    
+    return signature, timestamp
+
+async def fetch_bybit_balance():
+    try:
+        params = {
+            'accountType': 'UNIFIED'
+        }
+        
+        signature, timestamp = await get_bybit_signature(params)
+        
+        headers = {
+            'X-BAPI-API-KEY': BYBIT_API_KEY,
+            'X-BAPI-SIGN': signature,
+            'X-BAPI-TIMESTAMP': timestamp,
+            'X-BAPI-RECV-WINDOW': '5000'
+        }
+        
+        url = f"{BYBIT_API}/v5/account/wallet-balance"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers) as response:
+                data = await response.json()
+                print(f"Bybit Balance Response: {data}")  # для отладки
+                
+                message = "Bybit Balance:\n\n"
+                
+                if data.get('retCode') == 0:
+                    balances = data.get('result', {}).get('list', [])
+                    if balances:
+                        balance = balances[0]
+                        total_equity = float(balance.get('totalEquity', '0'))
+                        wallet_balance = float(balance.get('totalWalletBalance', '0'))
+                        
+                        message += f"Total Equity: {total_equity:,.2f} USDT\n"
+                        message += f"Wallet Balance: {wallet_balance:,.2f} USDT\n\n"
+                        
+                        coins = balance.get('coin', [])
+                        if coins:
+                            message += "Details:\n"
+                            for coin in coins:
+                                if float(coin.get('walletBalance', '0')) > 0:
+                                    coin_name = coin.get('coin', '')
+                                    coin_balance = float(coin.get('walletBalance', '0'))
+                                    coin_value = float(coin.get('usdValue', '0'))
+                                    message += f"{coin_name}: {coin_balance:,.8f}"
+                                    if coin_name != 'USDT':
+                                        message += f" (≈ {coin_value:,.2f} USDT)"
+                                    message += "\n"
+                else:
+                    error_msg = data.get('retMsg', 'Unknown error')
+                    message += f"Error: {error_msg}"
+                    
+                return message
+
+    except Exception as e:
+        print(f"Bybit Balance Error: {str(e)}")
+        return "Error fetching Bybit balance"
+
+async def get_all_prices():
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{BINANCE_API}/api/v3/ticker/price") as r:
+            data = await r.json()
+            prices = {}
+            for item in data:
+                sym = item.get('symbol', '')
+                try:
+                    price = float(item.get('price', '0'))
+                except (TypeError, ValueError):
+                    continue
+                prices[sym] = price
+                if sym.endswith('USDT'):
+                    base = sym[:-4]
+                    if base:
+                        prices[base] = price
+            return prices
+
+@dp.message_handler(commands=["start"])
+async def start_cmd(message: types.Message):
+    if message.from_user.id not in ALLOWED_USERS:
+        await message.answer("دسترسی شما محدود شده است.")
+        return
+    await message.answer("برای دریافت اطلاعات، یکی از گزینه‌های زیر را انتخاب کنید:", reply_markup=main_keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == "main_menu")
+async def main_menu_handler(callback_query: types.CallbackQuery):
+    await callback_query.message.edit_text(
+        "برای دریافت اطلاعات، یکی از گزینه‌های زیر را انتخاب کنید:",
+        reply_markup=main_keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "binance_menu")
+async def binance_menu_handler(callback_query: types.CallbackQuery):
+    await callback_query.message.edit_text(
+        "منوی بایننس\nلطفا یکی از گزینه‌های زیر را انتخاب کنید:",
+        reply_markup=binance_keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "bybit_menu")
+async def bybit_menu_handler(callback_query: types.CallbackQuery):
+    await callback_query.message.edit_text(
+        "منوی بایبیت\nلطفا یکی از گزینه‌های زیر را انتخاب کنید:",
+        reply_markup=bybit_keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "get_prices")
+async def get_price_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ALLOWED_USERS:
+        await bot.answer_callback_query(callback_query.id, text="دسترسی محدود شده است.", show_alert=True)
+        return
+    await bot.answer_callback_query(callback_query.id)
+    msg = await fetch_prices()
+    await callback_query.message.edit_text(
+        msg,
+        reply_markup=main_keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "binance_balance")
+async def get_binance_balance_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ALLOWED_USERS:
+        await bot.answer_callback_query(callback_query.id, text="دسترسی محدود شده است.", show_alert=True)
+        return
+    await bot.answer_callback_query(callback_query.id)
+    msg = await fetch_binance_balance()
+    await callback_query.message.edit_text(
+        msg,
+        reply_markup=binance_keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "bybit_balance")
+async def get_bybit_balance_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ALLOWED_USERS:
+        await bot.answer_callback_query(callback_query.id, text="دسترسی محدود شده است.", show_alert=True)
+        return
+    await bot.answer_callback_query(callback_query.id)
+    msg = await fetch_bybit_balance()
+    await callback_query.message.edit_text(
+        msg,
+        reply_markup=bybit_keyboard
+    )
+@dp.callback_query_handler(lambda c: c.data.startswith("binance_position_"))
+async def binance_position_action_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ALLOWED_USERS:
+        await bot.answer_callback_query(callback_query.id, text="دسترسی محدود شده است.", show_alert=True)
+        return
+
+    action_data = callback_query.data.split("_")
+    position_index = int(action_data[2])
+    action = action_data[3]
+    
+    if action == "set_tp":
+        await callback_query.message.edit_text(
+            "لطفاً قیمت Take Profit را وارد کنید:",
+            reply_markup=types.ForceReply()
+        )
+    elif action == "set_sl":
+        await callback_query.message.edit_text(
+            "لطفاً قیمت Stop Loss را وارد کنید:",
+            reply_markup=types.ForceReply()
+        )
+    elif action.startswith("close_"):
+        percentage = int(action.split("_")[1])
+        await close_binance_position(callback_query, position_index, percentage)
+    elif action == "change_leverage":
+        await callback_query.message.edit_text(
+            "لطفاً لوریج جدید را وارد کنید (1-125):",
+            reply_markup=types.ForceReply()
+        )
+    elif action == "change_size":
+        await callback_query.message.edit_text(
+            "لطفاً سایز جدید پوزیشن را وارد کنید:",
+            reply_markup=types.ForceReply()
+        )
+
+async def fetch_prices():
+    try:
+        async with aiohttp.ClientSession() as session:
+            # قیمت‌ها از بایننس
+            coins = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+            binance = {}
+            for coin in coins:
+                async with session.get(f"{BINANCE_API}/api/v3/ticker/price?symbol={coin}") as r:
+                    data = await r.json()
+                    binance[coin[:-4]] = float(data["price"])
+
+            # قیمت‌ها از بایبیت
+            bybit = {}
+            for coin in coins:
+                async with session.get(f"{BYBIT_API}/v5/market/tickers?category=spot&symbol={coin}") as r:
+                    data = await r.json()
+                    if data.get('result', {}).get('list'):
+                        bybit[coin[:-4]] = float(data['result']['list'][0]['lastPrice'])
+
+            # قیمت تتر از والکس
+            usdt_tmn = "قیمت تتر در دسترس نیست"
+            async with session.get(f"{WALLEX_API}/markets") as r:
+                data = await r.json()
+                if "result" in data and "symbols" in data["result"]:
+                    if "USDTTMN" in data["result"]["symbols"]:
+                        market_data = data["result"]["symbols"]["USDTTMN"]
+                        if "stats" in market_data and "lastPrice" in market_data["stats"]:
+                            price = float(market_data["stats"]["lastPrice"])
+                            usdt_tmn = f"{price:,.0f} تومان"
+
+            return (
+                "نرخ لحظه‌ای ارزهای دیجیتال:\n\n"
+                f"USDT(WALLEX): {usdt_tmn}\n\n"
+                f"Binance:\n"
+                f"BTC: ${binance.get('BTC', 0):,.0f}\n"
+                f"ETH: ${binance.get('ETH', 0):,.0f}\n"
+                f"SOL: ${binance.get('SOL', 0):,.2f}\n\n"
+                f"Bybit:\n"
+                f"BTC: ${bybit.get('BTC', 0):,.0f}\n"
+                f"ETH: ${bybit.get('ETH', 0):,.0f}\n"
+                f"SOL: ${bybit.get('SOL', 0):,.2f}"
+            )
+    except Exception as e:
+        print(f"Error in fetch_prices: {str(e)}")
+        return "خطا در دریافت قیمت‌ها"
+
+async def fetch_binance_balance():
+    try:
+        timestamp = int(time.time() * 1000)
+        params = f"timestamp={timestamp}"
+        signature = await get_binance_signature(params)
+        headers = {'X-MBX-APIKEY': BINANCE_API_KEY}
+        
+        async with aiohttp.ClientSession() as session:
+            # دریافت موجودی اسپات
+            spot_url = f"{BINANCE_API}/api/v3/account?{params}&signature={signature}"
+            async with session.get(spot_url, headers=headers) as response:
+                spot_data = await response.json()
+
+            # دریافت موجودی فیوچرز
+            futures_params = f"timestamp={timestamp}"
+            futures_signature = await get_binance_signature(futures_params)
+            futures_url = f"{BINANCE_FUTURES_API}/fapi/v2/account?{futures_params}&signature={futures_signature}"
+            
+            async with session.get(futures_url, headers=headers) as response:
+                futures_data = await response.json()
+
+            # دریافت قیمت‌ها
+            prices = await get_all_prices()
+            
+            message = "موجودی بایننس:\n\n"
+            message += "اسپات:\n"
+            total_spot_usdt = 0
+
+            # پردازش موجودی اسپات
+            if 'balances' in spot_data:
+                spot_balances = []
+                for asset in spot_data['balances']:
+                    symbol = asset['asset']
+                    free = float(asset['free'])
+                    locked = float(asset['locked'])
+                    total = free + locked
+                    
+                    if total <= 0:
+                        continue
+
+                    usdt_value = 0
+                    if symbol == 'USDT':
+                        usdt_value = total
+                    elif f"{symbol}USDT" in prices:
+                        usdt_value = total * prices[f"{symbol}USDT"]
+                    elif symbol == 'USDC':
+                        usdt_value = total
+
+                    if usdt_value >= 0.01:
+                        total_spot_usdt += usdt_value
+                        spot_balances.append({
+                            'symbol': symbol,
+                            'amount': total,
+                            'usdt': usdt_value
+                        })
+
+                spot_balances.sort(key=lambda x: x['usdt'], reverse=True)
+                for balance in spot_balances:
+                    if balance['symbol'] == 'USDT':
+                        message += f"{balance['symbol']}: {balance['amount']:,.2f}\n"
+                    else:
+                        message += f"{balance['symbol']}: {balance['amount']:,.8f} (≈ {balance['usdt']:,.2f} USDT)\n"
+
+            message += f"\nمجموع اسپات: {total_spot_usdt:,.2f} USDT\n"
+
+            # پردازش موجودی فیوچرز
+            message += "\nفیوچرز:\n"
+            total_futures_usdt = 0
+
+            if 'assets' in futures_data:
+                futures_balances = []
+                for asset in futures_data['assets']:
+                    symbol = asset['asset']
+                    wallet_balance = float(asset['walletBalance'])
+                    
+                    if wallet_balance > 0:
+                        if symbol == 'USDT':
+                            futures_balances.append({
+                                'symbol': symbol,
+                                'amount': wallet_balance,
+                                'usdt': wallet_balance
+                            })
+                            total_futures_usdt += wallet_balance
+
+                futures_balances.sort(key=lambda x: x['usdt'], reverse=True)
+                for balance in futures_balances:
+                    message += f"{balance['symbol']}: {balance['amount']:,.2f}\n"
+
+            message += f"\nمجموع فیوچرز: {total_futures_usdt:,.2f} USDT\n"
+            message += f"\nمجموع کل: {(total_spot_usdt + total_futures_usdt):,.2f} USDT"
+            
+            return message
+                
+    except Exception as e:
+        print(f"Error in fetch_binance_balance: {str(e)}")
+        return "خطا در دریافت موجودی بایننس"
+async def fetch_bybit_positions():
+    try:
+        params = {
+            'category': 'linear',
+            'settleCoin': 'USDT'
+        }
+        
+        signature, timestamp = await get_bybit_signature(params)
+        
+        headers = {
+            'X-BAPI-API-KEY': BYBIT_API_KEY,
+            'X-BAPI-SIGN': signature,
+            'X-BAPI-TIMESTAMP': timestamp,
+            'X-BAPI-RECV-WINDOW': '5000'
+        }
+        
+        url = f"{BYBIT_API}/v5/position/list"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers) as response:
+                data = await response.json()
+                print(f"Bybit Positions Response: {data}")  # для отладки
+                
+                active_positions = []
+                
+                if data.get('retCode') == 0:
+                    positions = data.get('result', {}).get('list', [])
+                    for position in positions:
+                        size = float(position.get('size', '0'))
+                        if size == 0:
+                            continue
+                            
+                        entry_price = float(position.get('avgPrice', '0'))
+                        mark_price = float(position.get('markPrice', '0'))
+                        leverage = float(position.get('leverage', '1'))
+                        liq_price = float(position.get('liqPrice', '0'))
+                        unrealized_pnl = float(position.get('unrealisedPnl', '0'))
+                        position_value = float(position.get('positionValue', '0'))
+                        
+                        side = position.get('side', '')
+                        position_type = "Long" if side == "Buy" else "Short"
+                        
+                        if position_value != 0:
+                            roe = (unrealized_pnl / position_value) * 100
+                        else:
+                            roe = 0
+                            
+                        active_positions.append({
+                            'symbol': position.get('symbol', ''),
+                            'type': position_type,
+                            'size': size,
+                            'entry': entry_price,
+                            'mark': mark_price,
+                            'liq': liq_price,
+                            'leverage': leverage,
+                            'pnl': unrealized_pnl,
+                            'roe': roe
+                        })
+                
+                return active_positions
+
+    except Exception as e:
+        print(f"Bybit Positions Error: {str(e)}")
+        return []
+@dp.callback_query_handler(lambda c: c.data == "bybit_positions")
+async def get_bybit_positions_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ALLOWED_USERS:
+        await bot.answer_callback_query(callback_query.id, text="Access Denied", show_alert=True)
+        return
+
+    positions = await fetch_bybit_positions()
+    
+    if not positions:
+        await callback_query.message.edit_text(
+            "No active positions in Bybit",
+            reply_markup=bybit_keyboard
+        )
+        return
+
+    await callback_query.message.delete()
+
+    for i, pos in enumerate(positions):
+        message = (
+            f"{pos['symbol']} ({pos['type']})\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Size: {pos['size']:.4f}\n"
+            f"Leverage: {pos['leverage']}x\n"
+            f"Entry: ${pos['entry']:,.2f}\n"
+            f"Current: ${pos['mark']:,.2f}\n"
+            f"Liquidation: ${pos['liq']:,.2f}\n"
+            f"PNL: ${pos['pnl']:,.2f} ({pos['roe']:,.2f}%)\n"
+        )
+        
+        keyboard = await get_bybit_position_keyboard(pos['symbol'], i)
+        await bot.send_message(
+            callback_query.from_user.id,
+            message,
+            reply_markup=keyboard
+        )
+
+async def fetch_binance_positions():
+    try:
+        timestamp = int(time.time() * 1000)
+        params = f"timestamp={timestamp}"
+        signature = await get_binance_signature(params)
+        headers = {'X-MBX-APIKEY': BINANCE_API_KEY}
+        
+        async with aiohttp.ClientSession() as session:
+            positions_url = f"{BINANCE_FUTURES_API}/fapi/v2/positionRisk?{params}&signature={signature}"
+            async with session.get(positions_url, headers=headers) as response:
+                positions_data = await response.json()
+
+            active_positions = []
+            for position in positions_data:
+                size = float(position['positionAmt'])
+                if size == 0:
+                    continue
+
+                entry_price = float(position['entryPrice'])
+                mark_price = float(position['markPrice'])
+                leverage = float(position['leverage'])
+                liquidation_price = float(position['liquidationPrice'])
+                unreal_pnl = float(position['unRealizedProfit'])
+                
+                position_type = "Long" if size > 0 else "Short"
+                roe = (mark_price - entry_price) / entry_price * 100 * leverage if size > 0 else (entry_price - mark_price) / entry_price * 100 * leverage
+
+                active_positions.append({
+                    'symbol': position['symbol'],
+                    'type': position_type,
+                    'size': abs(size),
+                    'entry': entry_price,
+                    'mark': mark_price,
+                    'liq': liquidation_price,
+                    'leverage': leverage,
+                    'pnl': unreal_pnl,
+                    'roe': roe
+                })
+
+            return active_positions
+    except Exception as e:
+        print(f"Error in fetch_binance_positions: {str(e)}")
+        return []
+
+@dp.callback_query_handler(lambda c: c.data == "binance_positions")
+async def get_binance_positions_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ALLOWED_USERS:
+        await bot.answer_callback_query(callback_query.id, text="دسترسی محدود شده است.", show_alert=True)
+        return
+
+    positions = await fetch_binance_positions()
+    
+    if not positions:
+        await callback_query.message.edit_text(
+            "هیچ پوزیشن فعالی در بایننس وجود ندارد.",
+            reply_markup=binance_keyboard
+        )
+        return
+
+    await callback_query.message.delete()
+
+    for i, pos in enumerate(positions):
+        message = (
+            f"{pos['symbol']} ({pos['type']})\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"سایز: {pos['size']:.4f}\n"
+            f"لوریج: {pos['leverage']}x\n"
+            f"قیمت ورود: ${pos['entry']:,.2f}\n"
+            f"قیمت فعلی: ${pos['mark']:,.2f}\n"
+            f"قیمت لیکویید: ${pos['liq']:,.2f}\n"
+            f"سود/زیان: ${pos['pnl']:,.2f} ({pos['roe']:,.2f}%)\n"
+        )
+        
+        keyboard = await get_binance_position_keyboard(pos['symbol'], i)
+        await bot.send_message(
+            callback_query.from_user.id,
+            message,
+            reply_markup=keyboard
+        )
+
+async def close_binance_position(callback_query, position_index, percentage):
+    try:
+        await callback_query.message.edit_text(
+            f"درخواست بستن {percentage}% پوزیشن در بایننس ارسال شد.",
+            reply_markup=binance_keyboard
+        )
+    except Exception as e:
+        await callback_query.message.edit_text(
+            "خطا در بستن پوزیشن بایننس",
+            reply_markup=binance_keyboard
+        )
+
+COINEX_API = "https://api.coinex.com"
+COINEX_API_KEY = os.getenv("COINEX_API_KEY")
+COINEX_SECRET_KEY = os.getenv("COINEX_SECRET_KEY")
+# کیبورد CoinEx
+coinex_keyboard = InlineKeyboardMarkup(row_width=2)
+coinex_keyboard.add(
+    InlineKeyboardButton("Balance", callback_data="coinex_balance"),
+    InlineKeyboardButton("Positions", callback_data="coinex_positions")
+)
+coinex_keyboard.add(InlineKeyboardButton("Main Menu", callback_data="main_menu"))
+
+
+async def get_coinex_signature(method, path, timestamp):
+    # ساخت رشته برای امضا
+    prepared_str = f"{method}{path}{timestamp}"
+    
+    # ایجاد امضا با HMAC-SHA256
+    signature = hmac.new(
+        bytes(COINEX_SECRET_KEY, 'latin-1'),
+        bytes(prepared_str, 'latin-1'),
+        hashlib.sha256
+    ).hexdigest().lower()
+    
+    return signature
+
+async def fetch_coinex_balance():
+    try:
+        timestamp = str(int(time.time() * 1000))
+        path = "/v2/assets/spot/balance"
+        
+        signature = await get_coinex_signature("GET", path, timestamp)
+        
+        headers = {
+            'X-COINEX-KEY': COINEX_API_KEY,
+            'X-COINEX-SIGN': signature,
+            'X-COINEX-TIMESTAMP': timestamp,
+            'Content-Type': 'application/json'
+        }
+        
+        url = f"{COINEX_API}{path}"
+        
+        async with aiohttp.ClientSession() as session:
+            # دریافت موجودی‌ها
+            async with session.get(url, headers=headers) as response:
+                data = await response.json()
+                
+                if data.get('code') != 0:
+                    return f"Error: {data.get('message', 'Unknown error')}"
+                
+                message = "?? CoinEx Balance:\n\n"
+                total_usdt = 0
+                
+                # دریافت قیمت‌ها از یک منبع جایگزین (مثل CoinEx عمومی)
+                # بدون احراز هویت
+                try:
+                    # دریافت قیمت‌های عمومی CoinEx
+                    ticker_url = f"{COINEX_API}/v2/spot/market/ticker/all"
+                    async with session.get(ticker_url) as ticker_response:
+                        ticker_data = await ticker_response.json()
+                        print(f"Ticker Response: {ticker_data}")
+                        
+                        if ticker_data.get('code') == 0:
+                            prices = {}
+                            for market, ticker in ticker_data.get('data', {}).items():
+                                if market.endswith('USDT'):
+                                    coin = market[:-4]  # حذف USDT
+                                    prices[coin] = float(ticker['last'])
+                            print(f"Prices: {prices}")
+                        else:
+                            prices = {}
+                except Exception as e:
+                    print(f"Error fetching prices: {e}")
+                    prices = {}
+                
+                # پردازش موجودی‌ها
+                balances = data.get('data', [])
+                for balance in balances:
+                    coin = balance.get('ccy')
+                    available = float(balance.get('available', '0'))
+                    frozen = float(balance.get('frozen', '0'))
+                    total = available + frozen
+                    
+                    if total > 0:
+                        usdt_value = 0
+                        if coin == 'USDT':
+                            usdt_value = total
+                        elif coin in prices or f'{coin}USDT' in prices:
+                            usdt_value = total * (prices.get(coin) or prices.get(f'{coin}USDT', 0))
+                        
+                        total_usdt += usdt_value
+                        
+                        message += f"{coin}: {total:.8f}"
+                        if usdt_value > 0:
+                            message += f" (≈ ${usdt_value:.2f})"
+                        message += "\n"
+                
+                message += f"\n✅ Total Balance: ${total_usdt:.2f}"
+                return message
+                
+    except Exception as e:
+        print(f"Error in fetch_coinex_balance: {str(e)}")
+        return f"❌ Error fetching CoinEx balance: {str(e)}"
+async def get_coinex_position_keyboard(symbol, position_index):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    base_data = f"coinex_position_{position_index}"
+    
+    keyboard.add(
+        InlineKeyboardButton("TP", callback_data=f"{base_data}_set_tp"),
+        InlineKeyboardButton("SL", callback_data=f"{base_data}_set_sl")
+    )
+    keyboard.add(
+        InlineKeyboardButton("Close 100%", callback_data=f"{base_data}_close_100"),
+        InlineKeyboardButton("Close 75%", callback_data=f"{base_data}_close_75")
+    )
+    keyboard.add(
+        InlineKeyboardButton("Close 50%", callback_data=f"{base_data}_close_50"),
+        InlineKeyboardButton("Close 25%", callback_data=f"{base_data}_close_25")
+    )
+    keyboard.add(
+        InlineKeyboardButton("Leverage", callback_data=f"{base_data}_change_leverage"),
+        InlineKeyboardButton("Size", callback_data=f"{base_data}_change_size")
+    )
+    keyboard.add(InlineKeyboardButton("Main Menu", callback_data="main_menu"))
+    
+    return keyboard
+
+async def fetch_coinex_positions():
+    try:
+        tonce = str(int(time.time() * 1000))
+        params = {
+            'access_id': COINEX_API_KEY,
+            'tonce': tonce
+        }
+        
+        signature = await get_coinex_signature(params)
+        headers = {
+            'Authorization': signature,
+            'AccessId': COINEX_API_KEY
+        }
+        
+        url = f"{COINEX_API}/contract/position/pending"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers) as response:
+                data = await response.json()
+                
+                active_positions = []
+                
+                if data.get('code') == 0:
+                    positions = data.get('data', [])
+                    for position in positions:
+                        size = float(position.get('position_amount', '0'))
+                        if size == 0:
+                            continue
+                            
+                        entry_price = float(position.get('open_price', '0'))
+                        mark_price = float(position.get('mark_price', '0'))
+                        leverage = float(position.get('leverage', '1'))
+                        liq_price = float(position.get('liquidation_price', '0'))
+                        unrealized_pnl = float(position.get('unrealized_pnl', '0'))
+                        
+                        position_type = "Long" if position.get('side') == 1 else "Short"
+                        
+                        active_positions.append({
+                            'symbol': position.get('market'),
+                            'type': position_type,
+                            'size': abs(size),
+                            'entry': entry_price,
+                            'mark': mark_price,
+                            'liq': liq_price,
+                            'leverage': leverage,
+                            'pnl': unrealized_pnl,
+                            'roe': float(position.get('profit_rate', '0')) * 100
+                        })
+                
+                return active_positions
+
+    except Exception as e:
+        return []
+
+@dp.callback_query_handler(lambda c: c.data == "coinex_menu")
+async def coinex_menu_handler(callback_query: types.CallbackQuery):
+    await callback_query.message.edit_text(
+        "CoinEx Menu\nSelect an option:",
+        reply_markup=coinex_keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "coinex_balance")
+async def get_coinex_balance_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ALLOWED_USERS:
+        await bot.answer_callback_query(callback_query.id, text="Access Denied", show_alert=True)
+        return
+    await bot.answer_callback_query(callback_query.id)
+    msg = await fetch_coinex_balance()
+    try:
+        await callback_query.message.edit_text(msg, reply_markup=coinex_keyboard)
+    except MessageNotModified:
+        pass  # اگر پیام تغییر نکرده، خطا نگیر
+
+@dp.callback_query_handler(lambda c: c.data == "coinex_positions")
+async def get_coinex_positions_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ALLOWED_USERS:
+        await bot.answer_callback_query(callback_query.id, text="Access Denied", show_alert=True)
+        return
+
+    positions = await fetch_coinex_positions()
+    
+    if not positions:
+        await callback_query.message.edit_text(
+            "No active positions in CoinEx",
+            reply_markup=coinex_keyboard
+        )
+        return
+
+    await callback_query.message.delete()
+
+    for i, pos in enumerate(positions):
+        message = (
+            f"{pos['symbol']} ({pos['type']})\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Size: {pos['size']:.4f}\n"
+            f"Leverage: {pos['leverage']}x\n"
+            f"Entry: ${pos['entry']:,.2f}\n"
+            f"Current: ${pos['mark']:,.2f}\n"
+            f"Liquidation: ${pos['liq']:,.2f}\n"
+            f"PNL: ${pos['pnl']:,.2f} ({pos['roe']:,.2f}%)\n"
+        )
+        
+        keyboard = await get_coinex_position_keyboard(pos['symbol'], i)
+        await bot.send_message(
+            callback_query.from_user.id,
+            message,
+            reply_markup=keyboard
+        )
+
+
+
+async def bybit_create_market_close(symbol: str, side: str, qty: float):
+    """
+    Create a reduce-only market order on Bybit to close a percentage of a position.
+    side must be "Buy" or "Sell" (opposite of the open position).
+    """
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": side,
+        "orderType": "Market",
+        "reduceOnly": True,
+        "qty": f"{qty}",
+        "timeInForce": "ImmediateOrCancel"
+    }
+    signature, timestamp = await get_bybit_signature(params)
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": "5000",
+        "Content-Type": "application/json"
+    }
+    url = f"{BYBIT_API}/v5/order/create"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=params, headers=headers) as resp:
+            data = await resp.json()
+            return data
+
+@dp.callback_query_handler(lambda c: c.data.startswith("bybit_position_"))
+async def bybit_position_action_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ALLOWED_USERS:
+        await bot.answer_callback_query(callback_query.id, text="دسترسی محدود شده است.", show_alert=True)
+        return
+    await bot.answer_callback_query(callback_query.id)
+
+    # نمونه: bybit_position_2_close_50
+    parts = callback_query.data.split("_")
+    if len(parts) < 4:
+        await bot.answer_callback_query(callback_query.id, text="داده نامعتبر", show_alert=True)
+        return
+
+    try:
+        index = int(parts[2])
+    except ValueError:
+        await bot.answer_callback_query(callback_query.id, text="شناسه پوزیشن نامعتبر", show_alert=True)
+        return
+
+    action = "_".join(parts[3:])  # e.g., close_50, set_tp, set_sl
+
+    positions = await fetch_bybit_positions()
+    if not positions or index >= len(positions):
+        await callback_query.message.edit_text("پوزیشنی یافت نشد.", reply_markup=bybit_keyboard)
+        return
+
+    pos = positions[index]
+    symbol = pos["symbol"]
+    size = float(pos["size"])
+    side_open = "Buy" if pos["type"].lower() == "long" else "Sell"
+    side_close = "Sell" if side_open == "Buy" else "Buy"
+
+    if action.startswith("close_"):
+        try:
+            pct = int(action.split("_")[1])  # 25/50/75/100
+        except Exception:
+            pct = 100
+        qty = max(0.0, size * (pct / 100.0))
+        qty = float(f"{qty:.4f}")
+        if qty <= 0:
+            await callback_query.message.edit_text("حجم برای بستن کافی نیست.", reply_markup=bybit_keyboard)
+            return
+
+        resp = await bybit_create_market_close(symbol, side_close, qty)
+        ok = bool(resp and resp.get("retCode") == 0)
+        if ok:
+            await callback_query.message.edit_text(
+                f"✅ درخواست بستن {pct}% از {symbol} ارسال شد.",
+                reply_markup=bybit_keyboard
+            )
+        else:
+            err = resp.get("retMsg") if isinstance(resp, dict) else "نامشخص"
+            await callback_query.message.edit_text(
+                f"❌ خطا در بستن پوزیشن: {err}",
+                reply_markup=bybit_keyboard
+            )
+        return
+
+    await callback_query.message.edit_text("این گزینه به‌زودی اضافه می‌شود.", reply_markup=bybit_keyboard)
+
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
