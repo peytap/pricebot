@@ -383,38 +383,57 @@ async def fetch_coinex_balance():
             'X-COINEX-TIMESTAMP': timestamp, 'Content-Type': 'application/json'
         }
         url = f"{COINEX_API}{path}"
+        
+        # Get prices from Binance as the source of truth
+        prices = await get_all_binance_prices()
+
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as response:
                 data = await response.json()
-                if data.get('code') != 0: return f"Error: {data.get('message', 'Unknown error')}"
+                if data.get('code') != 0: 
+                    return f"Error fetching CoinEx balance: {data.get('message', 'Unknown error')}"
+                
                 message = "CoinEx Balance:\n\n"
                 total_usdt = 0
-                prices = {}
-                try:
-                    ticker_url = f"{COINEX_API}/v2/spot/market/ticker/all"
-                    async with session.get(ticker_url) as ticker_response:
-                        ticker_data = await ticker_response.json()
-                        if ticker_data.get('code') == 0:
-                            for market, ticker in ticker_data.get('data', {}).items():
-                                if market.endswith('USDT'): prices[market[:-4]] = float(ticker['last'])
-                except Exception as e: print(f"Error fetching CoinEx prices: {e}")
-                
-                for balance in data.get('data', []):
-                    coin = balance.get('ccy')
-                    total = float(balance.get('available', '0')) + float(balance.get('frozen', '0'))
-                    if total > 0:
+                balances_to_display = []
+
+                for coin_data in data.get('data', []):
+                    coin = coin_data.get('ccy')
+                    total = float(coin_data.get('available', '0')) + float(coin_data.get('frozen', '0'))
+                    
+                    if total > 0.00000001:
                         usdt_value = 0
-                        if coin == 'USDT': usdt_value = total
-                        elif coin in prices: usdt_value = total * prices.get(coin, 0)
-                        total_usdt += usdt_value
-                        message += f"{coin}: {total:.8f}"
-                        if usdt_value > 0 and coin != 'USDT': message += f" (≈ ${usdt_value:.2f})\n"
-                        else: message += "\n"
-                message += f"\nTotal Balance: ${total_usdt:.2f}"
+                        if coin == 'USDT':
+                            usdt_value = total
+                        # Check for the price in the Binance data
+                        elif f"{coin}USDT" in prices:
+                            usdt_value = total * prices[f"{coin}USDT"]
+                        
+                        if usdt_value > 0.01:
+                            total_usdt += usdt_value
+                            balances_to_display.append({
+                                'coin': coin,
+                                'total': total,
+                                'usdt_value': usdt_value
+                            })
+                
+                # Sort balances by their USDT value
+                balances_to_display.sort(key=lambda x: x['usdt_value'], reverse=True)
+                
+                # Format the final message
+                for item in balances_to_display:
+                    message += f"{item['coin']}: {item['total']:.8f}"
+                    if item['coin'] != 'USDT':
+                        message += f" (≈ ${item['usdt_value']:,.2f})\n"
+                    else:
+                        message += "\n"
+
+                message += f"\nTotal Balance: ${total_usdt:,.2f}"
                 return message
+
     except Exception as e:
         print(f"Error in fetch_coinex_balance: {str(e)}")
-        return f"Error fetching CoinEx balance: {str(e)}"
+        return "Error fetching CoinEx balance"
 
 async def fetch_coinex_positions():
     try:
