@@ -1,8 +1,7 @@
 import os
-import time
-import hmac
-import hashlib
-import json
+import asyncio
+from dotenv import load_dotenv
+import ccxt.async_support as ccxt
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -10,912 +9,240 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
-from aiogram.utils.exceptions import MessageNotModified
-from dotenv import load_dotenv
 
+# --- Load Environment Variables ---
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ALLOWED_USERS = [int(user_id.strip()) for user_id in os.getenv("ALLOWED_USER_ID", "0").split(",")]
-BINANCE_API = "https://api.binance.com"
-BINANCE_FUTURES_API = "https://fapi.binance.com"
-BYBIT_API = "https://api.bybit.com"
+ALLOWED_USERS = [int(user_id.strip()) for user_id in os.getenv("ALLOWED_USER_ID", "").split(",") if user_id]
 WALLEX_API = "https://api.wallex.ir/v1"
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_SECRET_KEY = os.getenv("BYBIT_SECRET_KEY")
-COINEX_API = "https://api.coinex.com"
-COINEX_API_KEY = os.getenv("COINEX_API_KEY")
-COINEX_SECRET_KEY = os.getenv("COINEX_SECRET_KEY")
 
-# --- FSM Storage and Bot Initialization ---
+# --- Exchange API Keys ---
+EXCHANGES = {
+    "binance": {"apiKey": os.getenv("BINANCE_API_KEY"), "secret": os.getenv("BINANCE_SECRET_KEY")},
+    "bybit": {"apiKey": os.getenv("BYBIT_API_KEY"), "secret": os.getenv("BYBIT_SECRET_KEY")},
+    "coinex": {"apiKey": os.getenv("COINEX_API_KEY"), "secret": os.getenv("COINEX_SECRET_KEY")},
+}
+
+# --- Bot Initialization (Using MarkdownV2) ---
 storage = MemoryStorage()
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.MARKDOWN_V2)
 dp = Dispatcher(bot, storage=storage)
+
+# --- Helper Function for MarkdownV2 ---
+def escape_markdown(text: any) -> str:
+    """Escapes special characters for Telegram MarkdownV2."""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return str(text).translate(str.maketrans({char: f'\\{char}' for char in escape_chars}))
 
 # --- FSM States ---
 class PositionState(StatesGroup):
-    waiting_for_tp = State()
-    waiting_for_sl = State()
-    waiting_for_leverage = State()
+    pass # Can be expanded later
 
-# --- Keyboards ---
-
-# Main Menu
-main_keyboard = InlineKeyboardMarkup(row_width=3)
-main_keyboard.add(
-    InlineKeyboardButton("Rate", callback_data="get_prices"),
-    InlineKeyboardButton("Binance", callback_data="binance_menu"),
-    InlineKeyboardButton("Bybit", callback_data="bybit_menu"),
-    InlineKeyboardButton("CoinEx", callback_data="coinex_menu")
-)
-
-# Binance Menu
-binance_keyboard = InlineKeyboardMarkup(row_width=2)
-binance_keyboard.add(
-    InlineKeyboardButton("Balance", callback_data="binance_balance"),
-    InlineKeyboardButton("Positions", callback_data="binance_positions")
-)
-binance_keyboard.add(InlineKeyboardButton("Main Menu", callback_data="main_menu"))
-
-# Bybit Menu
-bybit_keyboard = InlineKeyboardMarkup(row_width=2)
-bybit_keyboard.add(
-    InlineKeyboardButton("Balance", callback_data="bybit_balance"),
-    InlineKeyboardButton("Positions", callback_data="bybit_positions")
-)
-bybit_keyboard.add(InlineKeyboardButton("Main Menu", callback_data="main_menu"))
-
-# CoinEx Menu
-coinex_keyboard = InlineKeyboardMarkup(row_width=2)
-coinex_keyboard.add(
-    InlineKeyboardButton("Balance", callback_data="coinex_balance"),
-    InlineKeyboardButton("Positions", callback_data="coinex_positions")
-)
-coinex_keyboard.add(InlineKeyboardButton("Main Menu", callback_data="main_menu"))
-
-
-async def get_position_keyboard(exchange, symbol, position_index):
+# --- Keyboard Layouts ---
+def get_main_menu():
     keyboard = InlineKeyboardMarkup(row_width=2)
-    base_data = f"{exchange}_position_{position_index}"
-
     keyboard.add(
-        InlineKeyboardButton("TP", callback_data=f"{base_data}_set_tp"),
-        InlineKeyboardButton("SL", callback_data=f"{base_data}_set_sl")
+        InlineKeyboardButton("🏦 صرافی‌ها", callback_data="menu_exchanges"),
+        InlineKeyboardButton("📈 اطلاعات بازار", callback_data="menu_market_info")
     )
-    keyboard.add(
-        InlineKeyboardButton("Close 100%", callback_data=f"{base_data}_close_100"),
-        InlineKeyboardButton("Close 75%", callback_data=f"{base_data}_close_75")
-    )
-    keyboard.add(
-        InlineKeyboardButton("Close 50%", callback_data=f"{base_data}_close_50"),
-        InlineKeyboardButton("Close 25%", callback_data=f"{base_data}_close_25")
-    )
-    keyboard.add(
-        InlineKeyboardButton("Leverage", callback_data=f"{base_data}_change_leverage"),
-        InlineKeyboardButton("Size", callback_data=f"{base_data}_change_size") # Placeholder
-    )
-    keyboard.add(InlineKeyboardButton("Main Menu", callback_data="main_menu"))
-
     return keyboard
 
+def get_exchanges_menu():
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("Binance", callback_data="exchange_binance"),
+        InlineKeyboardButton("Bybit", callback_data="exchange_bybit"),
+        InlineKeyboardButton("CoinEx", callback_data="exchange_coinex")
+    )
+    keyboard.add(InlineKeyboardButton("⬅️ بازگشت", callback_data="main_menu"))
+    return keyboard
 
-# --- Signature Generators ---
+def get_exchange_actions_menu(exchange_name: str):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("💰 موجودی", callback_data=f"balance_{exchange_name}"),
+        InlineKeyboardButton("📊 پوزیشن‌ها", callback_data=f"positions_{exchange_name}")
+    )
+    keyboard.add(InlineKeyboardButton("⬅️ بازگشت به صرافی‌ها", callback_data="menu_exchanges"))
+    return keyboard
 
-async def get_binance_signature(query_string):
-    return hmac.new(
-        BINANCE_SECRET_KEY.encode('utf-8'),
-        query_string.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-
-
-async def get_bybit_signature(params, recv_window='5000'):
-    timestamp = str(int(time.time() * 1000))
-    param_str = '&'.join([f'{key}={value}' for key, value in sorted(params.items())])
-    to_sign = str(timestamp) + BYBIT_API_KEY + recv_window + param_str
-
-    signature = hmac.new(
-        bytes(BYBIT_SECRET_KEY, 'utf-8'),
-        bytes(to_sign, 'utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-
-    return signature, timestamp
-
-
-async def get_coinex_signature(method, path, body_or_params, timestamp):
-    if isinstance(body_or_params, dict):
-        body_or_params = json.dumps(body_or_params)
-        
-    prepared_str = f"{method}{path}{body_or_params}{timestamp}{COINEX_SECRET_KEY}"
-    signature = hashlib.sha256(prepared_str.encode('utf-8')).hexdigest()
-    return signature
-
-
-# --- Price Fetching ---
-async def get_all_binance_prices():
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f"{BINANCE_API}/api/v3/ticker/price") as r:
-            data = await r.json()
-            prices = {}
-            for item in data:
-                sym = item.get('symbol', '')
-                try:
-                    price = float(item.get('price', '0'))
-                except (TypeError, ValueError):
-                    continue
-                prices[sym] = price
-            return prices
-
-
-async def fetch_prices():
+# --- API Fetching Functions ---
+async def fetch_wallex_usdt_price():
     try:
         async with aiohttp.ClientSession() as session:
-            # Binance prices
-            coins = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-            binance = {}
-            for coin in coins:
-                async with session.get(f"{BINANCE_API}/api/v3/ticker/price?symbol={coin}") as r:
-                    data = await r.json()
-                    binance[coin[:-4]] = float(data["price"])
-
-            # Bybit prices
-            bybit = {}
-            for coin in coins:
-                async with session.get(f"{BYBIT_API}/v5/market/tickers?category=spot&symbol={coin}") as r:
-                    data = await r.json()
-                    if data.get('result', {}).get('list'):
-                        bybit[coin[:-4]] = float(data['result']['list'][0]['lastPrice'])
-
-            # Wallex USDT price
-            usdt_tmn = "N/A"
-            async with session.get(f"{WALLEX_API}/markets") as r:
-                data = await r.json()
-                if "result" in data and "symbols" in data["result"]:
-                    if "USDTTMN" in data["result"]["symbols"]:
-                        market_data = data["result"]["symbols"]["USDTTMN"]
-                        if "stats" in market_data and "lastPrice" in market_data["stats"]:
-                            price = float(market_data["stats"]["lastPrice"])
-                            usdt_tmn = f"{price:,.0f} Toman"
-
-            return (
-                "Real-time cryptocurrency rates:\n\n"
-                f"USDT (WALLEX): {usdt_tmn}\n\n"
-                f"Binance:\n"
-                f"BTC: ${binance.get('BTC', 0):,.0f}\n"
-                f"ETH: ${binance.get('ETH', 0):,.0f}\n"
-                f"SOL: ${binance.get('SOL', 0):,.2f}\n\n"
-                f"Bybit:\n"
-                f"BTC: ${bybit.get('BTC', 0):,.0f}\n"
-                f"ETH: ${bybit.get('ETH', 0):,.0f}\n"
-                f"SOL: ${bybit.get('SOL', 0):,.2f}"
-            )
-    except Exception as e:
-        print(f"Error in fetch_prices: {str(e)}")
-        return "Error fetching prices"
-
-# --- Balance & Position Fetching (Binance) ---
-async def fetch_binance_balance():
-    try:
-        timestamp = int(time.time() * 1000)
-        params = f"timestamp={timestamp}"
-        signature = await get_binance_signature(params)
-        headers = {'X-MBX-APIKEY': BINANCE_API_KEY}
-
-        async with aiohttp.ClientSession() as session:
-            spot_url = f"{BINANCE_API}/api/v3/account?{params}&signature={signature}"
-            async with session.get(spot_url, headers=headers) as response:
-                spot_data = await response.json()
-
-            futures_params = f"timestamp={timestamp}"
-            futures_signature = await get_binance_signature(futures_params)
-            futures_url = f"{BINANCE_FUTURES_API}/fapi/v2/account?{futures_params}&signature={futures_signature}"
-
-            async with session.get(futures_url, headers=headers) as response:
-                futures_data = await response.json()
-
-            prices = await get_all_binance_prices()
-
-            message = "Binance Balance:\n\n"
-            message += "Spot:\n"
-            total_spot_usdt = 0
-
-            if 'balances' in spot_data:
-                spot_balances = []
-                for asset in spot_data['balances']:
-                    symbol = asset['asset']
-                    free = float(asset['free'])
-                    locked = float(asset['locked'])
-                    total = free + locked
-                    if total <= 0: continue
-                    usdt_value = 0
-                    if symbol == 'USDT': usdt_value = total
-                    elif f"{symbol}USDT" in prices: usdt_value = total * prices[f"{symbol}USDT"]
-                    elif symbol == 'USDC': usdt_value = total
-
-                    if usdt_value >= 0.01:
-                        total_spot_usdt += usdt_value
-                        spot_balances.append({'symbol': symbol, 'amount': total, 'usdt': usdt_value})
-
-                spot_balances.sort(key=lambda x: x['usdt'], reverse=True)
-                for balance in spot_balances:
-                    if balance['symbol'] == 'USDT':
-                        message += f"{balance['symbol']}: {balance['amount']:,.2f}\n"
-                    else:
-                        message += f"{balance['symbol']}: {balance['amount']:,.8f} (≈ ${balance['usdt']:,.2f})\n"
-
-            message += f"\nTotal Spot: ${total_spot_usdt:,.2f}\n"
-            message += "\nFutures:\n"
-            total_futures_usdt = 0
-
-            if 'assets' in futures_data:
-                futures_balances = []
-                for asset in futures_data['assets']:
-                    symbol = asset['asset']
-                    wallet_balance = float(asset['walletBalance'])
-                    if wallet_balance > 0 and symbol == 'USDT':
-                        futures_balances.append({'symbol': symbol, 'amount': wallet_balance, 'usdt': wallet_balance})
-                        total_futures_usdt += wallet_balance
-                futures_balances.sort(key=lambda x: x['usdt'], reverse=True)
-                for balance in futures_balances:
-                    message += f"{balance['symbol']}: ${balance['amount']:,.2f}\n"
-
-            message += f"\nTotal Futures: ${total_futures_usdt:,.2f}\n"
-            message += f"\nTotal: ${(total_spot_usdt + total_futures_usdt):,.2f}"
-            return message
-
-    except Exception as e:
-        print(f"Error in fetch_binance_balance: {str(e)}")
-        return "Error fetching Binance balance"
-
-
-async def fetch_binance_positions():
-    try:
-        timestamp = int(time.time() * 1000)
-        params_str = f"timestamp={timestamp}"
-        signature = await get_binance_signature(params_str)
-        headers = {'X-MBX-APIKEY': BINANCE_API_KEY}
-
-        async with aiohttp.ClientSession() as session:
-            positions_url = f"{BINANCE_FUTURES_API}/fapi/v2/positionRisk?{params_str}&signature={signature}"
-            async with session.get(positions_url, headers=headers) as response:
-                positions_data = await response.json()
-
-            active_positions = []
-            for position in positions_data:
-                size = float(position['positionAmt'])
-                if size == 0: continue
-                entry_price = float(position['entryPrice'])
-                mark_price = float(position['markPrice'])
-                leverage = float(position['leverage'])
-                unreal_pnl = float(position['unRealizedProfit'])
-                position_type = "Long" if size > 0 else "Short"
-                roe = (mark_price - entry_price) / entry_price * 100 * leverage if size > 0 else (entry_price - mark_price) / entry_price * 100 * leverage
-
-                active_positions.append({
-                    'symbol': position['symbol'], 'type': position_type, 'size': abs(size),
-                    'entry': entry_price, 'mark': mark_price, 'liq': float(position['liquidationPrice']),
-                    'leverage': leverage, 'pnl': unreal_pnl, 'roe': roe
-                })
-            return active_positions
-    except Exception as e:
-        print(f"Error in fetch_binance_positions: {str(e)}")
-        return []
-
-# --- Balance & Position Fetching (Bybit) ---
-
-async def fetch_bybit_balance():
-    try:
-        params = {'accountType': 'UNIFIED'}
-        signature, timestamp = await get_bybit_signature(params)
-        headers = {
-            'X-BAPI-API-KEY': BYBIT_API_KEY, 'X-BAPI-SIGN': signature,
-            'X-BAPI-TIMESTAMP': timestamp, 'X-BAPI-RECV-WINDOW': '5000'
-        }
-        url = f"{BYBIT_API}/v5/account/wallet-balance"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers) as response:
+            async with session.get(f"{WALLEX_API}/markets") as response:
+                if response.status != 200: return "N/A"
                 data = await response.json()
-                message = "Bybit Balance:\n\n"
-                if data.get('retCode') == 0:
-                    balances = data.get('result', {}).get('list', [])
-                    if balances:
-                        balance = balances[0]
-                        message += f"Total Equity: {float(balance.get('totalEquity', '0')):,.2f} USDT\n"
-                        message += f"Wallet Balance: {float(balance.get('totalWalletBalance', '0')):,.2f} USDT\n\n"
-                        coins = balance.get('coin', [])
-                        if coins:
-                            message += "Details:\n"
-                            for coin in coins:
-                                if float(coin.get('walletBalance', '0')) > 0:
-                                    coin_name = coin.get('coin', '')
-                                    message += f"{coin_name}: {float(coin.get('walletBalance', '0')):,.8f}"
-                                    if coin_name != 'USDT':
-                                        message += f" (≈ ${float(coin.get('usdValue', '0')):,.2f})\n"
-                                    else: message += "\n"
-                else: message += f"Error: {data.get('retMsg', 'Unknown error')}"
-                return message
-    except Exception as e:
-        print(f"Bybit Balance Error: {str(e)}")
-        return "Error fetching Bybit balance"
+                price = data.get("result", {}).get("symbols", {}).get("USDTTMN", {}).get("stats", {}).get("lastPrice")
+                return f"{float(price):,.0f} تومان" if price else "N/A"
+    except Exception:
+        return "N/A"
 
-
-async def fetch_bybit_positions():
+async def fetch_exchange_prices(exchange_name: str, symbols: list):
+    prices = {}
+    exchange = await get_exchange(exchange_name)
+    if not exchange: return prices
     try:
-        params = {'category': 'linear', 'settleCoin': 'USDT'}
-        signature, timestamp = await get_bybit_signature(params)
-        headers = {
-            'X-BAPI-API-KEY': BYBIT_API_KEY, 'X-BAPI-SIGN': signature,
-            'X-BAPI-TIMESTAMP': timestamp, 'X-BAPI-RECV-WINDOW': '5000'
-        }
-        url = f"{BYBIT_API}/v5/position/list"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers) as response:
-                data = await response.json()
-                active_positions = []
-                if data.get('retCode') == 0:
-                    for position in data.get('result', {}).get('list', []):
-                        size = float(position.get('size', '0'))
-                        if size == 0: continue
-                        position_value = float(position.get('positionValue', '0'))
-                        unrealized_pnl = float(position.get('unrealisedPnl', '0'))
-                        active_positions.append({
-                            'symbol': position.get('symbol', ''), 'type': "Long" if position.get('side') == "Buy" else "Short",
-                            'size': size, 'entry': float(position.get('avgPrice', '0')),
-                            'mark': float(position.get('markPrice', '0')), 'liq': float(position.get('liqPrice', '0')),
-                            'leverage': float(position.get('leverage', '1')), 'pnl': unrealized_pnl,
-                            'roe': (unrealized_pnl / position_value) * 100 if position_value != 0 else 0
-                        })
-                return active_positions
+        tickers = await exchange.fetch_tickers(symbols)
+        for symbol, ticker_data in tickers.items():
+            prices[symbol.split('/')[0]] = ticker_data['last']
     except Exception as e:
-        print(f"Bybit Positions Error: {str(e)}")
-        return []
+        print(f"Could not fetch prices from {exchange_name}: {e}")
+    finally:
+        if exchange: await exchange.close()
+    return prices
 
-# --- Balance & Position Fetching (CoinEx) ---
-async def fetch_coinex_balance():
-    try:
-        timestamp = str(int(time.time() * 1000))
-        path = "/v2/assets/spot/balance"
-        signature = await get_coinex_signature("GET", path, "", timestamp)
-        headers = {
-            'X-COINEX-KEY': COINEX_API_KEY, 'X-COINEX-SIGN': signature,
-            'X-COINEX-TIMESTAMP': timestamp, 'Content-Type': 'application/json'
-        }
-        url = f"{COINEX_API}{path}"
-        
-        # Get prices from Binance as the source of truth
-        prices = await get_all_binance_prices()
+async def get_exchange(exchange_name: str):
+    if exchange_name not in EXCHANGES: return None
+    config = EXCHANGES[exchange_name].copy()
+    exchange_class = getattr(ccxt, exchange_name)
+    return exchange_class(config)
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                data = await response.json()
-                if data.get('code') != 0: 
-                    return f"Error fetching CoinEx balance: {data.get('message', 'Unknown error')}"
-                
-                message = "CoinEx Balance:\n\n"
-                total_usdt = 0
-                balances_to_display = []
+async def format_balance_message(balance_data, tickers):
+    """Helper to format a specific balance section (e.g., Spot or Futures)."""
+    message = ""
+    total_usdt_value = 0
+    balances_to_display = []
 
-                for coin_data in data.get('data', []):
-                    coin = coin_data.get('ccy')
-                    total = float(coin_data.get('available', '0')) + float(coin_data.get('frozen', '0'))
-                    
-                    if total > 0.00000001:
-                        usdt_value = 0
-                        if coin == 'USDT':
-                            usdt_value = total
-                        # Check for the price in the Binance data
-                        elif f"{coin}USDT" in prices:
-                            usdt_value = total * prices[f"{coin}USDT"]
-                        
-                        if usdt_value > 0.01:
-                            total_usdt += usdt_value
-                            balances_to_display.append({
-                                'coin': coin,
-                                'total': total,
-                                'usdt_value': usdt_value
-                            })
-                
-                # Sort balances by their USDT value
-                balances_to_display.sort(key=lambda x: x['usdt_value'], reverse=True)
-                
-                # Format the final message
-                for item in balances_to_display:
-                    message += f"{item['coin']}: {item['total']:.8f}"
-                    if item['coin'] != 'USDT':
-                        message += f" (≈ ${item['usdt_value']:,.2f})\n"
-                    else:
-                        message += "\n"
-
-                message += f"\nTotal Balance: ${total_usdt:,.2f}"
-                return message
-
-    except Exception as e:
-        print(f"Error in fetch_coinex_balance: {str(e)}")
-        return "Error fetching CoinEx balance"
-
-async def fetch_coinex_positions():
-    try:
-        timestamp = str(int(time.time() * 1000))
-        path = "/v2/futures/position"
-        signature = await get_coinex_signature("GET", path, "", timestamp)
-        headers = {
-            'X-COINEX-KEY': COINEX_API_KEY, 'X-COINEX-SIGN': signature,
-            'X-COINEX-TIMESTAMP': timestamp
-        }
-        url = f"{COINEX_API}{path}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                data = await response.json()
-                active_positions = []
-                if data.get('code') == 0:
-                    for position in data.get('data', []):
-                        size = float(position.get('amount', '0'))
-                        if size == 0: continue
-                        active_positions.append({
-                            'symbol': position.get('market'), 'type': "Long" if position.get('side') == 'long' else "Short",
-                            'pos_id': position.get('position_id'), 'size': abs(size),
-                            'entry': float(position.get('open_price', '0')), 'mark': float(position.get('latest_price', '0')),
-                            'liq': float(position.get('liq_price', '0')), 'leverage': float(position.get('leverage', '1')),
-                            'pnl': float(position.get('unrealized_pnl', '0')), 'roe': float(position.get('return_rate', '0')) * 100
-                        })
-                return active_positions
-    except Exception as e:
-        print(f"Error fetching CoinEx positions: {e}")
-        return []
-
-# --- API Call Helpers for Modifications ---
-
-async def binance_set_leverage(symbol: str, leverage: int):
-    params_str = f"symbol={symbol}&leverage={leverage}&timestamp={int(time.time() * 1000)}"
-    signature = await get_binance_signature(params_str)
-    url = f"{BINANCE_FUTURES_API}/fapi/v1/leverage?{params_str}&signature={signature}"
-    headers = {'X-MBX-APIKEY': BINANCE_API_KEY}
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers) as resp:
-            return await resp.json()
-
-async def binance_set_tpsl(symbol: str, side: str, price: float, order_type: str):
-    params_str = (f"symbol={symbol}&side={side}&type={order_type}&stopPrice={price}"
-                  f"&reduceOnly=true&timestamp={int(time.time() * 1000)}")
-    signature = await get_binance_signature(params_str)
-    url = f"{BINANCE_FUTURES_API}/fapi/v1/order?{params_str}&signature={signature}"
-    headers = {'X-MBX-APIKEY': BINANCE_API_KEY}
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers) as resp:
-            return await resp.json()
-
-async def bybit_set_tpsl(symbol: str, tp: str = "", sl: str = ""):
-    params = {"category": "linear", "symbol": symbol, "takeProfit": tp, "stopLoss": sl}
-    signature, timestamp = await get_bybit_signature(params)
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": signature,
-        "X-BAPI-TIMESTAMP": timestamp, "Content-Type": "application/json"
-    }
-    url = f"{BYBIT_API}/v5/position/set-tpsl"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=params, headers=headers) as resp:
-            return await resp.json()
-
-async def bybit_set_leverage(symbol: str, leverage: str):
-    params = {"category": "linear", "symbol": symbol, "buyLeverage": leverage, "sellLeverage": leverage}
-    signature, timestamp = await get_bybit_signature(params)
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": signature,
-        "X-BAPI-TIMESTAMP": timestamp, "Content-Type": "application/json"
-    }
-    url = f"{BYBIT_API}/v5/position/set-leverage"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=params, headers=headers) as resp:
-            return await resp.json()
+    for currency, amount in balance_data['total'].items():
+        if amount > 0:
+            usdt_value = 0
+            if currency == 'USDT':
+                usdt_value = amount
+            elif f"{currency}/USDT" in tickers:
+                usdt_value = amount * tickers[f"{currency}/USDT"]['last']
             
-async def coinex_set_tpsl(market: str, pos_id: int, tp: str = None, sl: str = None):
-    body = {"market": market, "position_id": pos_id}
-    if tp: body["take_profit_price"] = tp
-    if sl: body["stop_loss_price"] = sl
+            if usdt_value > 1:
+                balances_to_display.append({'coin': currency, 'total': amount, 'usdt': usdt_value})
+                total_usdt_value += usdt_value
     
-    timestamp = str(int(time.time() * 1000))
-    path = "/v2/futures/modify-position-stop"
-    signature = await get_coinex_signature("POST", path, body, timestamp)
-    headers = {
-        'X-COINEX-KEY': COINEX_API_KEY, 'X-COINEX-SIGN': signature,
-        'X-COINEX-TIMESTAMP': timestamp, 'Content-Type': 'application/json'
-    }
-    url = f"{COINEX_API}{path}"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=body, headers=headers) as resp:
-            return await resp.json()
+    balances_to_display.sort(key=lambda x: x['usdt'], reverse=True)
 
-async def coinex_set_leverage(market: str, leverage: int, pos_type: int):
-    body = {"market": market, "leverage": leverage, "position_type": pos_type}
-    timestamp = str(int(time.time() * 1000))
-    path = "/v2/futures/modify-position-leverage"
-    signature = await get_coinex_signature("POST", path, body, timestamp)
-    headers = {
-        'X-COINEX-KEY': COINEX_API_KEY, 'X-COINEX-SIGN': signature,
-        'X-COINEX-TIMESTAMP': timestamp, 'Content-Type': 'application/json'
-    }
-    url = f"{COINEX_API}{path}"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=body, headers=headers) as resp:
-            return await resp.json()
+    for bal in balances_to_display:
+        coin = escape_markdown(bal['coin'])
+        total = escape_markdown(f"{bal['total']:.6f}".rstrip('0').rstrip('.'))
+        usdt_val = escape_markdown(f"{bal['usdt']:,.2f}")
+        message += f"*{coin}*: `{total}` \\(≈ ${usdt_val}\\)\n"
+        
+    return message, total_usdt_value
 
-# --- Handlers ---
+async def fetch_unified_balance(exchange_name: str):
+    exchange = await get_exchange(exchange_name)
+    if not exchange: return f"صرافی '{exchange_name}' پیکربندی نشده است\\."
+
+    try:
+        message = f"💰 *موجودی صرافی {exchange.name}*\n\n"
+        grand_total_usdt = 0
+        
+        # Fetch all tickers once
+        tickers = await exchange.fetch_tickers()
+
+        if exchange_name == 'binance':
+            # --- Binance: Fetch Spot and Futures separately ---
+            # Fetch Spot Balance
+            spot_balance = await exchange.fetch_balance()
+            spot_message, spot_total = await format_balance_message(spot_balance, tickers)
+            if spot_total > 1:
+                grand_total_usdt += spot_total
+                message += "*Spot*\n" + spot_message
+                message += f"__Total Spot__: `${escape_markdown(f'{spot_total:,.2f}')}`\n\n"
+
+            # Fetch Futures Balance
+            futures_balance = await exchange.fetch_balance(params={'type': 'future'})
+            futures_message, futures_total = await format_balance_message(futures_balance, tickers)
+            if futures_total > 1:
+                grand_total_usdt += futures_total
+                message += "*Futures*\n" + futures_message
+                message += f"__Total Futures__: `${escape_markdown(f'{futures_total:,.2f}')}`\n\n"
+
+        else:
+            # --- For Bybit, CoinEx, and others ---
+            balance = await exchange.fetch_balance()
+            balance_message, total_usdt = await format_balance_message(balance, tickers)
+            grand_total_usdt += total_usdt
+            if total_usdt > 1:
+                message += balance_message
+
+        if grand_total_usdt == 0:
+            return f"موجودی قابل توجهی در صرافی {exchange.name} یافت نشد\\. لطفاً دسترسی کلید API خود را بررسی کنید\\."
+
+        message += f"\n*موجودی کل کل*: `${escape_markdown(f'{grand_total_usdt:,.2f}')}`"
+        return message
+
+    except ccxt.AuthenticationError:
+        return f"❌ *خطای احراز هویت* برای {exchange.name}\\!\n\nلطفاً مطمئن شوید کلیدهای API شما صحیح و معتبر هستند\\."
+    except Exception as e:
+        return f"خطا در دریافت موجودی {exchange.name}: {escape_markdown(str(e))}"
+    finally:
+        if exchange: await exchange.close()
+
+
+# --- Telegram Handlers ---
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
     if message.from_user.id not in ALLOWED_USERS:
-        await message.answer("Access denied.")
-        return
-    await message.answer("Select an option:", reply_markup=main_keyboard)
+        return await message.answer("❌ شما اجازه دسترسی به این ربات را ندارید\\.")
+    await message.answer("سلام\\! به ربات مدیریت کریپتو خود خوش آمدید\\.", reply_markup=get_main_menu())
 
-@dp.message_handler(state='*', commands='cancel')
-async def cancel_handler(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is None:
-        return
+@dp.callback_query_handler(lambda c: c.data == "main_menu", state='*')
+async def main_menu_handler(query: types.CallbackQuery, state: FSMContext):
     await state.finish()
-    await message.reply('Action cancelled.', reply_markup=types.ReplyKeyboardRemove())
+    await query.message.edit_text("منوی اصلی:", reply_markup=get_main_menu())
 
-@dp.callback_query_handler(lambda c: c.data == "main_menu")
-async def main_menu_handler(callback_query: types.CallbackQuery):
-    await callback_query.message.edit_text("Select an option:", reply_markup=main_keyboard)
+@dp.callback_query_handler(lambda c: c.data == "menu_exchanges")
+async def exchanges_menu_handler(query: types.CallbackQuery):
+    await query.message.edit_text("لطفاً صرافی مورد نظر خود را انتخاب کنید:", reply_markup=get_exchanges_menu())
 
-@dp.callback_query_handler(lambda c: c.data == "binance_menu")
-async def binance_menu_handler(callback_query: types.CallbackQuery):
-    await callback_query.message.edit_text("Binance Menu", reply_markup=binance_keyboard)
-
-@dp.callback_query_handler(lambda c: c.data == "bybit_menu")
-async def bybit_menu_handler(callback_query: types.CallbackQuery):
-    await callback_query.message.edit_text("Bybit Menu", reply_markup=bybit_keyboard)
-
-@dp.callback_query_handler(lambda c: c.data == "coinex_menu")
-async def coinex_menu_handler(callback_query: types.CallbackQuery):
-    await callback_query.message.edit_text("CoinEx Menu", reply_markup=coinex_keyboard)
-
-@dp.callback_query_handler(lambda c: c.data == "get_prices")
-async def get_price_handler(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ALLOWED_USERS:
-        await bot.answer_callback_query(callback_query.id, text="Access denied.", show_alert=True)
-        return
-    await bot.answer_callback_query(callback_query.id)
-    msg = await fetch_prices()
-    try: await callback_query.message.edit_text(msg, reply_markup=main_keyboard)
-    except MessageNotModified: pass
-
-@dp.callback_query_handler(lambda c: c.data == "binance_balance")
-async def get_binance_balance_handler(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ALLOWED_USERS:
-        await bot.answer_callback_query(callback_query.id, text="Access denied.", show_alert=True)
-        return
-    await bot.answer_callback_query(callback_query.id)
-    msg = await fetch_binance_balance()
-    try: await callback_query.message.edit_text(msg, reply_markup=binance_keyboard)
-    except MessageNotModified: pass
-
-@dp.callback_query_handler(lambda c: c.data == "bybit_balance")
-async def get_bybit_balance_handler(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ALLOWED_USERS:
-        await bot.answer_callback_query(callback_query.id, text="Access denied.", show_alert=True)
-        return
-    await bot.answer_callback_query(callback_query.id)
-    msg = await fetch_bybit_balance()
-    try: await callback_query.message.edit_text(msg, reply_markup=bybit_keyboard)
-    except MessageNotModified: pass
-
-@dp.callback_query_handler(lambda c: c.data == "coinex_balance")
-async def get_coinex_balance_handler(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ALLOWED_USERS:
-        await bot.answer_callback_query(callback_query.id, text="Access denied.", show_alert=True)
-        return
-    await bot.answer_callback_query(callback_query.id)
-    msg = await fetch_coinex_balance()
-    try: await callback_query.message.edit_text(msg, reply_markup=coinex_keyboard)
-    except MessageNotModified: pass
-
-# --- Position List Handlers ---
-@dp.callback_query_handler(lambda c: c.data == "binance_positions")
-async def get_binance_positions_handler(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ALLOWED_USERS:
-        await bot.answer_callback_query(callback_query.id, text="Access denied.", show_alert=True)
-        return
-    positions = await fetch_binance_positions()
-    if not positions:
-        await callback_query.message.edit_text("No active positions in Binance.", reply_markup=binance_keyboard)
-        return
-    await callback_query.message.delete()
-    for i, pos in enumerate(positions):
-        message = (f"{pos['symbol']} ({pos['type']})\n━━━━━━━━━━━━━━━━━━━━━\n"
-                   f"Size: {pos['size']:.4f}\nLeverage: {pos['leverage']}x\n"
-                   f"Entry Price: ${pos['entry']:,.2f}\nCurrent Price: ${pos['mark']:,.2f}\n"
-                   f"Liquidation Price: ${pos['liq']:,.2f}\nPNL: ${pos['pnl']:,.2f} ({pos['roe']:,.2f}%)\n")
-        keyboard = await get_position_keyboard('binance', pos['symbol'], i)
-        await bot.send_message(callback_query.from_user.id, message, reply_markup=keyboard)
-
-@dp.callback_query_handler(lambda c: c.data == "bybit_positions")
-async def get_bybit_positions_handler(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ALLOWED_USERS:
-        await bot.answer_callback_query(callback_query.id, text="Access Denied", show_alert=True)
-        return
-    positions = await fetch_bybit_positions()
-    if not positions:
-        await callback_query.message.edit_text("No active positions in Bybit", reply_markup=bybit_keyboard)
-        return
-    await callback_query.message.delete()
-    for i, pos in enumerate(positions):
-        message = (f"{pos['symbol']} ({pos['type']})\n━━━━━━━━━━━━━━━━━━━━━\n"
-                   f"Size: {pos['size']:.4f}\nLeverage: {pos['leverage']}x\n"
-                   f"Entry: ${pos['entry']:,.2f}\nCurrent: ${pos['mark']:,.2f}\n"
-                   f"Liquidation: ${pos['liq']:,.2f}\nPNL: ${pos['pnl']:,.2f} ({pos['roe']:,.2f}%)\n")
-        keyboard = await get_position_keyboard('bybit', pos['symbol'], i)
-        await bot.send_message(callback_query.from_user.id, message, reply_markup=keyboard)
-
-@dp.callback_query_handler(lambda c: c.data == "coinex_positions")
-async def get_coinex_positions_handler(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id not in ALLOWED_USERS:
-        await bot.answer_callback_query(callback_query.id, text="Access Denied", show_alert=True)
-        return
-    positions = await fetch_coinex_positions()
-    if not positions:
-        await callback_query.message.edit_text("No active positions in CoinEx", reply_markup=coinex_keyboard)
-        return
-    await callback_query.message.delete()
-    for i, pos in enumerate(positions):
-        message = (f"{pos['symbol']} ({pos['type']})\n━━━━━━━━━━━━━━━━━━━━━\n"
-                   f"Size: {pos['size']:.4f}\nLeverage: {pos['leverage']}x\n"
-                   f"Entry: ${pos['entry']:,.2f}\nCurrent: ${pos['mark']:,.2f}\n"
-                   f"Liquidation: ${pos['liq']:,.2f}\nPNL: ${pos['pnl']:,.2f} ({pos['roe']:,.2f}%)\n")
-        keyboard = await get_position_keyboard('coinex', pos['symbol'], i)
-        await bot.send_message(callback_query.from_user.id, message, reply_markup=keyboard)
-
-# --- Position Action Handlers ---
-
-# BINANCE
-@dp.callback_query_handler(lambda c: c.data.startswith("binance_position_"))
-async def binance_position_action_handler(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id not in ALLOWED_USERS:
-        await bot.answer_callback_query(callback_query.id, text="Access denied.", show_alert=True)
-        return
+@dp.callback_query_handler(lambda c: c.data == "menu_market_info")
+async def market_info_handler(query: types.CallbackQuery):
+    await query.answer("در حال دریافت قیمت‌ها...")
     
-    parts = callback_query.data.split("_")
-    index = int(parts[2])
-    action = "_".join(parts[3:])
-
-    positions = await fetch_binance_positions()
-    if not positions or index >= len(positions):
-        await callback_query.message.edit_text("Position not found.", reply_markup=binance_keyboard)
-        return
-
-    pos = positions[index]
-    symbol = pos["symbol"]
-    side_close = "SELL" if pos["type"].lower() == "long" else "BUY"
-
-    await state.update_data(symbol=symbol, side_close=side_close, exchange='binance')
+    coins_to_fetch = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
     
-    if action == "set_tp":
-        await PositionState.waiting_for_tp.set()
-        await callback_query.message.answer(f"Enter Take Profit price for {symbol}: \n(or /cancel)")
-    elif action == "set_sl":
-        await PositionState.waiting_for_sl.set()
-        await callback_query.message.answer(f"Enter Stop Loss price for {symbol}: \n(or /cancel)")
-    elif action == "change_leverage":
-        await PositionState.waiting_for_leverage.set()
-        await callback_query.message.answer(f"Enter new leverage for {symbol} (e.g., 10): \n(or /cancel)")
-    else:
-        await callback_query.message.answer("This action is not yet implemented.")
-    await callback_query.answer()
-
-
-# BYBIT
-@dp.callback_query_handler(lambda c: c.data.startswith("bybit_position_"))
-async def bybit_position_action_handler(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id not in ALLOWED_USERS:
-        await bot.answer_callback_query(callback_query.id, text="Access denied.", show_alert=True)
-        return
-
-    parts = callback_query.data.split("_")
-    index = int(parts[2])
-    action = "_".join(parts[3:])
-
-    positions = await fetch_bybit_positions()
-    if not positions or index >= len(positions):
-        await callback_query.message.edit_text("Position not found.", reply_markup=bybit_keyboard)
-        return
-
-    pos = positions[index]
-    symbol = pos["symbol"]
+    wallex_task = fetch_wallex_usdt_price()
+    binance_task = fetch_exchange_prices('binance', coins_to_fetch)
+    bybit_task = fetch_exchange_prices('bybit', coins_to_fetch)
     
-    if action.startswith("close_"):
-        try: pct = int(action.split("_")[1])
-        except (ValueError, IndexError): pct = 100
-        qty = max(0.0, float(pos["size"]) * (pct / 100.0))
-        side_close = "Sell" if pos["type"].lower() == "long" else "Buy"
-        resp = await bybit_create_market_close(symbol, side_close, f"{qty:.4f}")
-        if resp and resp.get("retCode") == 0:
-            await callback_query.message.edit_text(f"✅ Request to close {pct}% of {symbol} sent.", reply_markup=bybit_keyboard)
-        else:
-            await callback_query.message.edit_text(f"❌ Error closing position: {resp.get('retMsg', 'Unknown')}", reply_markup=bybit_keyboard)
-        return
+    usdt_price, binance_prices, bybit_prices = await asyncio.gather(
+        wallex_task, binance_task, bybit_task
+    )
 
-    await state.update_data(symbol=symbol, exchange='bybit')
+    message = f"📈 *اطلاعات بازار*\n\n"
+    message += f"🇮🇷 *قیمت تتر \\(والکس\\)*: `{escape_markdown(usdt_price)}`\n"
+    message += "—\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n\n"
 
-    if action == "set_tp":
-        await PositionState.waiting_for_tp.set()
-        await callback_query.message.answer(f"Enter Take Profit price for {symbol}: \n(or /cancel)")
-    elif action == "set_sl":
-        await PositionState.waiting_for_sl.set()
-        await callback_query.message.answer(f"Enter Stop Loss price for {symbol}: \n(or /cancel)")
-    elif action == "change_leverage":
-        await PositionState.waiting_for_leverage.set()
-        await callback_query.message.answer(f"Enter new leverage for {symbol} (e.g., 10): \n(or /cancel)")
-    else:
-        await callback_query.message.answer("This action is not yet implemented.")
-    await callback_query.answer()
+    message += "*Binance*\n"
+    for coin, price in binance_prices.items():
+        message += f"*{coin}*: `${escape_markdown(f'{price:,.2f}')}`\n"
+    message += "\n"
 
-# COINEX
-@dp.callback_query_handler(lambda c: c.data.startswith("coinex_position_"))
-async def coinex_position_action_handler(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id not in ALLOWED_USERS:
-        await bot.answer_callback_query(callback_query.id, text="Access denied.", show_alert=True)
-        return
+    message += "*Bybit*\n"
+    for coin, price in bybit_prices.items():
+        message += f"*{coin}*: `${escape_markdown(f'{price:,.2f}')}`\n"
 
-    parts = callback_query.data.split("_")
-    index = int(parts[2])
-    action = "_".join(parts[3:])
-
-    positions = await fetch_coinex_positions()
-    if not positions or index >= len(positions):
-        await callback_query.message.edit_text("Position not found.", reply_markup=coinex_keyboard)
-        return
-
-    pos = positions[index]
-    symbol = pos["symbol"]
-    pos_id = pos["pos_id"]
-    # For leverage: 1 for isolated, 2 for cross. Assuming isolated margin.
-    pos_type_margin = 1 
-
-    await state.update_data(symbol=symbol, pos_id=pos_id, pos_type_margin=pos_type_margin, exchange='coinex')
-
-    if action == "set_tp":
-        await PositionState.waiting_for_tp.set()
-        await callback_query.message.answer(f"Enter Take Profit price for {symbol}: \n(or /cancel)")
-    elif action == "set_sl":
-        await PositionState.waiting_for_sl.set()
-        await callback_query.message.answer(f"Enter Stop Loss price for {symbol}: \n(or /cancel)")
-    elif action == "change_leverage":
-        await PositionState.waiting_for_leverage.set()
-        await callback_query.message.answer(f"Enter new leverage for {symbol} (e.g., 10): \n(or /cancel)")
-    else:
-        await callback_query.message.answer("This action is not yet implemented.")
-    await callback_query.answer()
-
-# --- State Handlers for User Input ---
-
-@dp.message_handler(state=PositionState.waiting_for_tp)
-async def process_tp(message: types.Message, state: FSMContext):
-    try:
-        price = float(message.text)
-        data = await state.get_data()
-        symbol = data.get('symbol')
-        exchange = data.get('exchange')
-
-        if exchange == 'binance':
-            side_close = data.get('side_close')
-            resp = await binance_set_tpsl(symbol, side_close, price, "TAKE_PROFIT_MARKET")
-            if 'orderId' in resp:
-                await message.answer(f"✅ Take Profit for {symbol} set to ${price}.")
-            else:
-                await message.answer(f"❌ Error setting TP: {resp.get('msg', 'Unknown')}")
-        
-        elif exchange == 'bybit':
-            resp = await bybit_set_tpsl(symbol, tp=str(price))
-            if resp.get("retCode") == 0:
-                await message.answer(f"✅ Take Profit for {symbol} set to ${price}.")
-            else:
-                await message.answer(f"❌ Error setting TP: {resp.get('retMsg', 'Unknown')}")
-        
-        elif exchange == 'coinex':
-            pos_id = data.get('pos_id')
-            resp = await coinex_set_tpsl(symbol, pos_id, tp=str(price))
-            if resp.get("code") == 0:
-                 await message.answer(f"✅ Take Profit for {symbol} set to ${price}.")
-            else:
-                 await message.answer(f"❌ Error setting TP: {resp.get('message', 'Unknown')}")
-
-    except ValueError:
-        await message.answer("Invalid price. Please enter a number.")
-    finally:
-        await state.finish()
-
-@dp.message_handler(state=PositionState.waiting_for_sl)
-async def process_sl(message: types.Message, state: FSMContext):
-    try:
-        price = float(message.text)
-        data = await state.get_data()
-        symbol = data.get('symbol')
-        exchange = data.get('exchange')
-
-        if exchange == 'binance':
-            side_close = data.get('side_close')
-            resp = await binance_set_tpsl(symbol, side_close, price, "STOP_MARKET")
-            if 'orderId' in resp:
-                await message.answer(f"✅ Stop Loss for {symbol} set to ${price}.")
-            else:
-                await message.answer(f"❌ Error setting SL: {resp.get('msg', 'Unknown')}")
-        
-        elif exchange == 'bybit':
-            resp = await bybit_set_tpsl(symbol, sl=str(price))
-            if resp.get("retCode") == 0:
-                await message.answer(f"✅ Stop Loss for {symbol} set to ${price}.")
-            else:
-                await message.answer(f"❌ Error setting SL: {resp.get('retMsg', 'Unknown')}")
-        
-        elif exchange == 'coinex':
-            pos_id = data.get('pos_id')
-            resp = await coinex_set_tpsl(symbol, pos_id, sl=str(price))
-            if resp.get("code") == 0:
-                 await message.answer(f"✅ Stop Loss for {symbol} set to ${price}.")
-            else:
-                 await message.answer(f"❌ Error setting SL: {resp.get('message', 'Unknown')}")
-
-    except ValueError:
-        await message.answer("Invalid price. Please enter a number.")
-    finally:
-        await state.finish()
-
-@dp.message_handler(state=PositionState.waiting_for_leverage)
-async def process_leverage(message: types.Message, state: FSMContext):
-    try:
-        leverage = int(message.text)
-        data = await state.get_data()
-        symbol = data.get('symbol')
-        exchange = data.get('exchange')
-
-        if exchange == 'binance':
-            resp = await binance_set_leverage(symbol, leverage)
-            if 'leverage' in resp and resp['leverage'] == leverage:
-                await message.answer(f"✅ Leverage for {symbol} set to {leverage}x.")
-            else:
-                await message.answer(f"❌ Error setting leverage: {resp.get('msg', 'Unknown')}")
-
-        elif exchange == 'bybit':
-            resp = await bybit_set_leverage(symbol, str(leverage))
-            if resp.get("retCode") == 0:
-                await message.answer(f"✅ Leverage for {symbol} set to {leverage}x.")
-            else:
-                await message.answer(f"❌ Error setting leverage: {resp.get('retMsg', 'Unknown')}")
-        
-        elif exchange == 'coinex':
-            pos_type_margin = data.get('pos_type_margin')
-            resp = await coinex_set_leverage(symbol, leverage, pos_type_margin)
-            if resp.get("code") == 0:
-                await message.answer(f"✅ Leverage for {symbol} set to {leverage}x.")
-            else:
-                await message.answer(f"❌ Error setting leverage: {resp.get('message', 'Unknown')}")
-
-    except ValueError:
-        await message.answer("Invalid leverage. Please enter a whole number.")
-    finally:
-        await state.finish()
+    await query.message.edit_text(message, reply_markup=get_main_menu())
 
 
-# --- Bybit Market Close (already existed) ---
-async def bybit_create_market_close(symbol: str, side: str, qty: str):
-    params = {
-        "category": "linear", "symbol": symbol, "side": side,
-        "orderType": "Market", "reduceOnly": True, "qty": qty,
-        "timeInForce": "ImmediateOrCancel"
-    }
-    signature, timestamp = await get_bybit_signature(params)
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-SIGN": signature,
-        "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": "5000",
-        "Content-Type": "application/json"
-    }
-    url = f"{BYBIT_API}/v5/order/create"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=params, headers=headers) as resp:
-            return await resp.json()
+@dp.callback_query_handler(lambda c: c.data.startswith("exchange_"))
+async def exchange_actions_handler(query: types.CallbackQuery):
+    exchange_name = query.data.split("_")[1]
+    await query.message.edit_text(f"صرافی *{escape_markdown(exchange_name.title())}* انتخاب شد\\. چه کاری می‌خواهید انجام دهید؟", reply_markup=get_exchange_actions_menu(exchange_name))
 
+@dp.callback_query_handler(lambda c: c.data.startswith("balance_"))
+async def get_balance_handler(query: types.CallbackQuery):
+    exchange_name = query.data.split("_")[1]
+    await query.answer(f"در حال دریافت موجودی از {exchange_name}...")
+    msg = await fetch_unified_balance(exchange_name)
+    await query.message.edit_text(msg, reply_markup=get_exchange_actions_menu(exchange_name))
+
+@dp.callback_query_handler(lambda c: c.data.startswith("positions_"))
+async def get_positions_handler(query: types.CallbackQuery):
+    await query.answer("این قابلیت به زودی اضافه خواهد شد!", show_alert=True)
+
+# --- Main Execution ---
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    if not BOT_TOKEN or not ALLOWED_USERS:
+        print("❌ ERROR: BOT_TOKEN and ALLOWED_USER_ID must be set in the .env file.")
+    else:
+        print("✅ Bot is running...")
+        executor.start_polling(dp, skip_updates=True)
