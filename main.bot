@@ -28,7 +28,8 @@ logger = Logger()
 
 # --- Load Environment Variables ---
 load_dotenv()
-BOT_TOKEN, ALLOWED_USERS = os.getenv("BOT_TOKEN"), [int(uid.strip()) for uid in os.getenv("ALLOWED_USER_ID", "").split(",") if uid]
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ALLOWED_USERS = [int(uid.strip()) for uid in os.getenv("ALLOWED_USER_ID", "").split(",") if uid]
 WALLEX_API = "https://api.wallex.ir/v1"
 API_KEYS = {
     "binance": {"key": os.getenv("BINANCE_API_KEY"), "secret": os.getenv("BINANCE_SECRET_KEY"), "url": "https://fapi.binance.com"},
@@ -43,27 +44,65 @@ dp = Dispatcher(bot, storage=storage)
 
 # --- Helper Functions & FSM ---
 def escape_markdown(text: any) -> str:
-    escape_chars = r'_*[]()~`>#+-=|{}.!'; return str(text).translate(str.maketrans({char: f'\\{char}' for char in escape_chars}))
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return str(text).translate(str.maketrans({char: f'\\{char}' for char in escape_chars}))
+
 def get_market_symbol(ccxt_symbol: str) -> str:
+    # 'XLM/USDT:USDT' -> 'XLMUSDT'
     return ccxt_symbol.split(':')[0].replace('/', '')
-class OrderState(StatesGroup): SetTP, SetSL = State(), State()
+
+class OrderState(StatesGroup):
+    SetTP = State()
+    SetSL = State()
 
 # --- Keyboards ---
-def get_main_menu(): return InlineKeyboardMarkup(row_width=2).add(InlineKeyboardButton("🏦 Exchanges", callback_data="menu_exchanges"), InlineKeyboardButton("📈 Market Info", callback_data="menu_market_info"))
-def get_exchanges_menu(): return InlineKeyboardMarkup(row_width=2).add(InlineKeyboardButton("Binance", callback_data="exchange_binance"), InlineKeyboardButton("Bybit", callback_data="exchange_bybit"), InlineKeyboardButton("CoinEx", callback_data="exchange_coinex"), InlineKeyboardButton("⬅️ Back", callback_data="main_menu"))
-def get_exchange_actions_menu(exchange_name: str): return InlineKeyboardMarkup(row_width=2).add(InlineKeyboardButton("💰 Balance", callback_data=f"balance_{exchange_name}"), InlineKeyboardButton("📊 Positions", callback_data=f"positions_{exchange_name}"), InlineKeyboardButton("⬅️ Back to Exchanges", callback_data="menu_exchanges"))
+def get_main_menu():
+    return InlineKeyboardMarkup(row_width=2).add(
+        InlineKeyboardButton("🏦 Exchanges", callback_data="menu_exchanges"),
+        InlineKeyboardButton("📈 Market Info", callback_data="menu_market_info")
+    )
+
+def get_exchanges_menu():
+    return InlineKeyboardMarkup(row_width=2).add(
+        InlineKeyboardButton("Binance", callback_data="exchange_binance"),
+        InlineKeyboardButton("Bybit", callback_data="exchange_bybit"),
+        InlineKeyboardButton("CoinEx", callback_data="exchange_coinex"),
+        InlineKeyboardButton("⬅️ Back", callback_data="main_menu")
+    )
+
+def get_exchange_actions_menu(exchange_name: str):
+    return InlineKeyboardMarkup(row_width=2).add(
+        InlineKeyboardButton("💰 Balance", callback_data=f"balance_{exchange_name}"),
+        InlineKeyboardButton("📊 Positions", callback_data=f"positions_{exchange_name}"),
+        InlineKeyboardButton("⬅️ Back to Exchanges", callback_data="menu_exchanges")
+    )
+
 def get_position_management_keyboard(exchange: str, symbol: str):
     symbol_safe = symbol.replace('/', 'SLASH').replace(':', 'COLON')
     base_cb = f"pos__{exchange}__{symbol_safe}"
-    return InlineKeyboardMarkup(row_width=3).row(InlineKeyboardButton("Close 25%", callback_data=f"{base_cb}__close_25"), InlineKeyboardButton("Close 50%", callback_data=f"{base_cb}__close_50"), InlineKeyboardButton("Close 100%", callback_data=f"{base_cb}__close_100")).row(InlineKeyboardButton("Set TP", callback_data=f"{base_cb}__set_tp"), InlineKeyboardButton("Set SL", callback_data=f"{base_cb}__set_sl")).add(InlineKeyboardButton("🔃 Refresh", callback_data=f"{base_cb}__refresh"), InlineKeyboardButton("⬅️ Back", callback_data=f"exchange_{exchange}"))
+    return InlineKeyboardMarkup(row_width=3).row(
+        InlineKeyboardButton("Close 25%", callback_data=f"{base_cb}__close_25"),
+        InlineKeyboardButton("Close 50%", callback_data=f"{base_cb}__close_50"),
+        InlineKeyboardButton("Close 100%", callback_data=f"{base_cb}__close_100")
+    ).row(
+        InlineKeyboardButton("Set TP", callback_data=f"{base_cb}__set_tp"),
+        InlineKeyboardButton("Set SL", callback_data=f"{base_cb}__set_sl")
+    ).add(
+        InlineKeyboardButton("🔃 Refresh", callback_data=f"{base_cb}__refresh"),
+        InlineKeyboardButton("⬅️ Back", callback_data=f"exchange_{exchange}")
+    )
 
 # --- Direct API Call Logic ---
 async def send_signed_request(exchange_name, method, endpoint, params=None):
     logger.add(f"Preparing signed request for {exchange_name} | Method: {method} | Endpoint: {endpoint}")
-    api_info = API_KEYS[exchange_name]; params = params or {}
+    api_info = API_KEYS.get(exchange_name)
+    if not api_info:
+        return {"error": "Unknown exchange"}
+    params = params or {}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
         try:
             if exchange_name == 'binance':
+                # For binance we build query and sign it (futures)
                 params['timestamp'] = int(time.time() * 1000)
                 query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
                 signature = hmac.new(api_info['secret'].encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -71,17 +110,29 @@ async def send_signed_request(exchange_name, method, endpoint, params=None):
                 headers = {'X-MBX-APIKEY': api_info['key']}
                 logger.add(f"Binance -> {method} {url}")
                 async with session.request(method.upper(), url, headers=headers) as resp:
-                    response_text = await resp.text(); logger.add(f"Binance Response: {response_text}"); return json.loads(response_text)
+                    text = await resp.text()
+                    logger.add(f"Binance Response: {text}")
+                    try: return json.loads(text)
+                    except: return {"raw": text}
             elif exchange_name == 'bybit':
                 ts, recv_window = str(int(time.time() * 1000)), "20000"
                 data_str = json.dumps(params) if method.upper() == "POST" else "&".join([f"{k}={v}" for k, v in sorted(params.items())])
                 to_sign = ts + api_info['key'] + recv_window + data_str
                 signature = hmac.new(api_info['secret'].encode('utf-8'), to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
-                headers = {'X-BAPI-API-KEY': api_info['key'], 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': recv_window, 'X-BAPI-SIGN': signature, 'Content-Type': 'application/json'}
+                headers = {
+                    'X-BAPI-API-KEY': api_info['key'],
+                    'X-BAPI-TIMESTAMP': ts,
+                    'X-BAPI-RECV-WINDOW': recv_window,
+                    'X-BAPI-SIGN': signature,
+                    'Content-Type': 'application/json'
+                }
                 url = f"{api_info['url']}{endpoint}"
                 logger.add(f"Bybit -> {method} {url} | Payload: {data_str}")
                 async with session.request(method.upper(), url, headers=headers, data=data_str if method.upper() == "POST" else None) as resp:
-                    response_text = await resp.text(); logger.add(f"Bybit Response: {response_text}"); return json.loads(response_text)
+                    text = await resp.text()
+                    logger.add(f"Bybit Response: {text}")
+                    try: return json.loads(text)
+                    except: return {"raw": text}
             elif exchange_name == 'coinex':
                 ts = str(int(time.time() * 1000))
                 body_str = json.dumps(params, separators=(',', ':')) if method.upper() == "POST" else ""
@@ -91,109 +142,162 @@ async def send_signed_request(exchange_name, method, endpoint, params=None):
                 url = f"{api_info['url']}{endpoint}"
                 logger.add(f"CoinEx -> {method} {url} | Payload: {body_str}")
                 async with session.request(method.upper(), url, headers=headers, data=body_str if method.upper() == "POST" else None) as resp:
-                    response_text = await resp.text(); logger.add(f"CoinEx Response: {response_text}"); return json.loads(response_text)
+                    text = await resp.text()
+                    logger.add(f"CoinEx Response: {text}")
+                    try: return json.loads(text)
+                    except: return {"raw": text}
         except Exception as e:
-            logger.add(f"ERROR in send_signed_request for {exchange_name}: {e}"); return {"error": str(e)}
+            logger.add(f"ERROR in send_signed_request for {exchange_name}: {e}")
+            return {"error": str(e)}
     return None
 
 # --- CCXT Data Fetching Logic ---
 async def get_exchange(exchange_name: str):
-    if not API_KEYS[exchange_name].get('key') or not API_KEYS[exchange_name].get('secret'):
+    api = API_KEYS.get(exchange_name)
+    if not api or not api.get('key') or not api.get('secret'):
         logger.add(f"API Key/Secret not found for {exchange_name}")
         return None
-    config = {'apiKey': API_KEYS[exchange_name]['key'], 'secret': API_KEYS[exchange_name]['secret'], 'enableRateLimit': True}
-    exchange_class = getattr(ccxt, exchange_name)
+    config = {'apiKey': api['key'], 'secret': api['secret'], 'enableRateLimit': True}
+    try:
+        exchange_class = getattr(ccxt, exchange_name)
+    except Exception as e:
+        logger.add(f"CCXT does not have exchange {exchange_name}: {e}")
+        return None
     exchange = exchange_class(config)
     await exchange.load_markets()
     return exchange
+
 async def fetch_positions_list(exchange_name: str, symbol: str = None):
     exchange = await get_exchange(exchange_name)
-    if not exchange or not exchange.has.get('fetchPositions', False):
-        if exchange: await exchange.close()
+    if not exchange:
         return None
     try:
+        if not exchange.has.get('fetchPositions', False):
+            return None
         positions = await exchange.fetch_positions(symbols=[symbol] if symbol else None)
         def _pos_size(p): return abs(p.get('contracts') or p.get('size') or 0)
         return [p for p in positions if _pos_size(p) > 0]
     finally:
         if exchange: await exchange.close()
+
 async def format_position_message(pos, exchange_name):
-    pnl_val, roe_val, liq_price, mark_price_val = pos.get('unrealizedPnl') or 0, pos.get('percentage') or 0, pos.get('liquidationPrice') or 0, pos.get('markPrice') or 0
-    symbol, side, leverage = pos['symbol'], pos.get('side', 'N/A').capitalize(), escape_markdown(f"{pos.get('leverage', 1):.0f}x")
-    contracts, entry_price, mark_price = escape_markdown(f"{abs(pos.get('contracts', 0)):.4f}".rstrip('0').rstrip('.')), escape_markdown(f"{pos.get('entryPrice', 0):,.4f}"), escape_markdown(f"{mark_price_val:,.4f}")
-    pnl, roe = escape_markdown(f"{pnl_val:,.2f}"), escape_markdown(f"{roe_val:,.2f}%")
-    direction_emoji, liq_dist_str = "🟢" if side.lower() == 'long' else "🔴", "N/A"
+    pnl_val = pos.get('unrealizedPnl') or 0
+    roe_val = pos.get('percentage') or 0
+    liq_price = pos.get('liquidationPrice') or 0
+    mark_price_val = pos.get('markPrice') or 0
+    symbol = pos.get('symbol', 'N/A')
+    side = pos.get('side', 'N/A').capitalize()
+    leverage = escape_markdown(f"{pos.get('leverage', 1):.0f}x")
+    contracts = escape_markdown(f"{abs(pos.get('contracts', 0)):.4f}".rstrip('0').rstrip('.'))
+    entry_price = escape_markdown(f"{pos.get('entryPrice', 0):,.4f}")
+    mark_price = escape_markdown(f"{mark_price_val:,.4f}")
+    pnl = escape_markdown(f"{pnl_val:,.2f}")
+    roe = escape_markdown(f"{roe_val:,.2f}%")
+    direction_emoji = "🟢" if side.lower() == 'long' else "🔴"
+    liq_dist_str = "N/A"
     if liq_price and mark_price_val > 0:
         percentage = (abs(mark_price_val - liq_price) / mark_price_val) * 100
         liq_dist_str = escape_markdown(f"{percentage:.2f}%")
-    return {'text': (f"{direction_emoji} *{escape_markdown(symbol)}* \\({escape_markdown(side)}\\)\n"
-                     f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
-                     f"▫️ *Size*: `{contracts}`\n▫️ *Leverage*: `{leverage}`\n"
-                     f"▫️ *Entry Price*: `${entry_price}`\n▫️ *Mark Price*: `${mark_price}`\n"
-                     f"▫️ *Liq\\. Distance*: `{liq_dist_str}`\n▫️ *PNL*: `${pnl}` \\(`{roe}`\\)"),
-            'keyboard': get_position_management_keyboard(exchange_name, symbol)}
+    text = (f"{direction_emoji} *{escape_markdown(symbol)}* \\({escape_markdown(side)}\\)\n"
+            f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
+            f"▫️ *Size*: `{contracts}`\n▫️ *Leverage*: `{leverage}`\n"
+            f"▫️ *Entry Price*: `${entry_price}`\n▫️ *Mark Price*: `${mark_price}`\n"
+            f"▫️ *Liq\\. Distance*: `{liq_dist_str}`\n▫️ *PNL*: `${pnl}` \\(`{roe}`\\)")
+    return {'text': text, 'keyboard': get_position_management_keyboard(exchange_name, symbol)}
+
 async def fetch_unified_balance(exchange_name: str):
     exchange = await get_exchange(exchange_name)
-    if not exchange: return f"Exchange '{escape_markdown(exchange_name)}' not configured\\."
+    if not exchange:
+        return f"Exchange '{escape_markdown(exchange_name)}' not configured\\."
     try:
-        message, grand_total_usdt, tickers = f"💰 *{escape_markdown(exchange.name)} Balance*\n\n", 0, await exchange.fetch_tickers()
+        message = f"💰 *{escape_markdown(exchange.name)} Balance*\n\n"
+        grand_total_usdt = 0
+        tickers = await exchange.fetch_tickers()
         if exchange_name in ['binance', 'coinex']:
             spot_balance = await exchange.fetch_balance()
             spot_message, spot_total = await format_balance_message(spot_balance, tickers)
-            if spot_total > 1: grand_total_usdt += spot_total; message += f"*Spot*\n{spot_message}__Total Spot__: `${escape_markdown(f'{spot_total:,.2f}')}`\n\n"
+            if spot_total > 1:
+                grand_total_usdt += spot_total
+                message += f"*Spot*\n{spot_message}__Total Spot__: `${escape_markdown(f'{spot_total:,.2f}')}`\n\n"
             futures_type = 'swap' if exchange_name == 'coinex' else 'future'
             futures_balance = await exchange.fetch_balance(params={'type': futures_type})
             futures_message, futures_total = await format_balance_message(futures_balance, tickers)
-            if futures_total > 1: grand_total_usdt += futures_total; message += f"*Futures*\n{futures_message}__Total Futures__: `${escape_markdown(f'{futures_total:,.2f}')}`\n\n"
+            if futures_total > 1:
+                grand_total_usdt += futures_total
+                message += f"*Futures*\n{futures_message}__Total Futures__: `${escape_markdown(f'{futures_total:,.2f}')}`\n\n"
         else:
-            balance = await exchange.fetch_balance(); balance_message, total_usdt = await format_balance_message(balance, tickers)
-            if total_usdt > 1: grand_total_usdt += total_usdt; message += balance_message
-        if grand_total_usdt == 0: return f"No significant balance found on {escape_markdown(exchange.name)}\\. Please check your API key permissions\\."
+            balance = await exchange.fetch_balance()
+            balance_message, total_usdt = await format_balance_message(balance, tickers)
+            if total_usdt > 1:
+                grand_total_usdt += total_usdt
+                message += balance_message
+        if grand_total_usdt == 0:
+            return f"No significant balance found on {escape_markdown(exchange.name)}\\. Please check your API key permissions\\."
         message += f"\n*Grand Total*: `${escape_markdown(f'{grand_total_usdt:,.2f}')}`"
         return message
-    except ccxt.AuthenticationError: return f"❌ *Authentication Error* for {escape_markdown(exchange.name)}\\_ Please ensure your API keys are correct and valid\\."
-    except Exception as e: return f"Error fetching balance for {escape_markdown(exchange.name)}: {escape_markdown(str(e))}"
+    except ccxt.AuthenticationError:
+        return f"❌ *Authentication Error* for {escape_markdown(exchange.name)}\\_ Please ensure your API keys are correct and valid\\."
+    except Exception as e:
+        return f"Error fetching balance for {escape_markdown(exchange.name)}: {escape_markdown(str(e))}"
     finally:
         if exchange: await exchange.close()
+
 async def format_balance_message(balance_data, tickers):
     message, total_usdt_value, balances_to_display = "", 0, []
-    for currency, amount in balance_data['total'].items():
-        if amount > 0:
+    for currency, amount in balance_data.get('total', {}).items():
+        if amount and amount > 0:
             usdt_value = 0
-            if currency == 'USDT': usdt_value = amount
-            elif f"{currency}/USDT" in tickers: usdt_value = amount * tickers[f"{currency}/USDT"]['last']
-            if usdt_value > 1: balances_to_display.append({'coin': currency, 'total': amount, 'usdt': usdt_value}); total_usdt_value += usdt_value
+            if currency == 'USDT':
+                usdt_value = amount
+            elif f"{currency}/USDT" in tickers:
+                usdt_value = amount * tickers[f"{currency}/USDT"]['last']
+            if usdt_value > 1:
+                balances_to_display.append({'coin': currency, 'total': amount, 'usdt': usdt_value})
+                total_usdt_value += usdt_value
     balances_to_display.sort(key=lambda x: x['usdt'], reverse=True)
     for bal in balances_to_display:
-        coin, total, usdt_val = escape_markdown(bal['coin']), escape_markdown(f"{bal['total']:.6f}".rstrip('0').rstrip('.')), escape_markdown(f"{bal['usdt']:,.2f}")
+        coin = escape_markdown(bal['coin'])
+        total = escape_markdown(f"{bal['total']:.6f}".rstrip('0').rstrip('.'))
+        usdt_val = escape_markdown(f"{bal['usdt']:,.2f}")
         message += f"*{coin}*: `{total}` \\(≈ ${usdt_val}\\)\n"
     return message, total_usdt_value
+
 async def fetch_wallex_usdt_price():
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
             async with session.get(f"{WALLEX_API}/markets") as response:
                 if response.status != 200: return "N/A"
-                data = await response.json(); price = data.get("result", {}).get("symbols", {}).get("USDTTMN", {}).get("stats", {}).get("lastPrice")
+                data = await response.json()
+                price = data.get("result", {}).get("symbols", {}).get("USDTTMN", {}).get("stats", {}).get("lastPrice")
                 return f"{float(price):,.0f} Toman" if price else "N/A"
-    except Exception: return "N/A"
+    except Exception:
+        return "N/A"
+
 async def fetch_exchange_prices(exchange_name: str, symbols: list):
-    prices = {}; exchange = await get_exchange(exchange_name)
-    if not exchange: return prices
+    prices = {}
+    exchange = await get_exchange(exchange_name)
+    if not exchange:
+        return prices
     try:
         tickers = await exchange.fetch_tickers(symbols)
-        for symbol, ticker_data in tickers.items(): prices[symbol.split('/')[0]] = ticker_data['last']
-    except Exception as e: print(f"Could not fetch prices from {exchange_name}: {e}")
+        for symbol, ticker_data in tickers.items():
+            prices[symbol.split('/')[0]] = ticker_data.get('last')
+    except Exception as e:
+        logger.add(f"Could not fetch prices from {exchange_name}: {e}")
     finally:
         if exchange: await exchange.close()
     return prices
-    
+
 # --- Telegram Handlers ---
 async def safe_edit_message(query: types.CallbackQuery, text: str, markup=None, send_new_on_fail=False):
-    try: await query.message.edit_text(text, reply_markup=markup)
+    try:
+        await query.message.edit_text(text, reply_markup=markup)
     except (MessageToEditNotFound, MessageNotModified, CantParseEntities) as e:
         logger.add(f"Safe edit failed: {e}. Sending new message.")
-        if send_new_on_fail: await bot.send_message(query.from_user.id, text, reply_markup=markup)
-        else: await query.answer()
+        if send_new_on_fail:
+            await bot.send_message(query.from_user.id, text, reply_markup=markup)
+        else:
+            await query.answer()
 
 async def auth_check(query: types.CallbackQuery) -> bool:
     if query.from_user.id not in ALLOWED_USERS:
@@ -204,7 +308,8 @@ async def auth_check(query: types.CallbackQuery) -> bool:
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
     logger.add("Received /start command")
-    if message.from_user.id not in ALLOWED_USERS: return await message.answer("❌ You are not authorized to use this bot\\.")
+    if message.from_user.id not in ALLOWED_USERS:
+        return await message.answer("❌ You are not authorized to use this bot\\.")
     start_message = "Hello\\! Welcome to your debug bot\\.\nUse /get\\_logs to view logs\\."
     await message.answer(start_message, reply_markup=get_main_menu())
 
@@ -216,30 +321,38 @@ async def get_logs_cmd(message: types.Message):
     if not logs:
         return await message.answer("No logs to display\\.")
     for i in range(0, len(logs), 4000):
-        chunk = logs[i:i+4000].replace('```', '`​`​`') # Prevent breaking Markdown
+        chunk = logs[i:i+4000].replace('```', '`​`​`')
         await message.answer(f"```{chunk}```")
     logger.clear()
 
 @dp.callback_query_handler(lambda c: c.data.startswith("menu_") or c.data.startswith("exchange_"), state='*')
 async def menu_handler(query: types.CallbackQuery, state: FSMContext):
     if not await auth_check(query): return
-    await state.finish(); action = query.data.split("_")[1]; logger.add(f"Menu handler called with action: {action}")
-    if action == "exchanges": await safe_edit_message(query, "Please select an exchange:", get_exchanges_menu())
+    await state.finish()
+    # action is the second token after first underscore: menu_exchanges -> exchanges
+    action = query.data.split("_", 1)[1]
+    logger.add(f"Menu handler called with action: {action}")
+    if action == "exchanges":
+        await safe_edit_message(query, "Please select an exchange:", get_exchanges_menu())
     elif action == "market":
         await query.answer("Fetching prices...")
         coins_to_fetch = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
-        wallex_task, binance_task, bybit_task = fetch_wallex_usdt_price(), fetch_exchange_prices('binance', coins_to_fetch), fetch_exchange_prices('bybit', coins_to_fetch)
+        wallex_task = fetch_wallex_usdt_price()
+        binance_task = fetch_exchange_prices('binance', coins_to_fetch)
+        bybit_task = fetch_exchange_prices('bybit', coins_to_fetch)
         usdt_price, binance_prices, bybit_prices = await asyncio.gather(wallex_task, binance_task, bybit_task)
         message = f"📈 *Market Info*\n\n" + f"🇮🇷 *USDT Price (Wallex)*: `{escape_markdown(usdt_price)}`\n" + "—\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n\n"
-        message += "*Binance*\n" + "".join([f"*{coin}*: `${escape_markdown(f'{price:,.2f}')}`\n" for coin, price in binance_prices.items()]) + "\n"
-        message += "*Bybit*\n" + "".join([f"*{coin}*: `${escape_markdown(f'{price:,.2f}')}`\n" for coin, price in bybit_prices.items()])
+        message += "*Binance*\n" + "".join([f"*{coin}*: `${escape_markdown(f'{price:,.2f}')}`\n" for coin, price in (binance_prices or {}).items()]) + "\n"
+        message += "*Bybit*\n" + "".join([f"*{coin}*: `${escape_markdown(f'{price:,.2f}')}`\n" for coin, price in (bybit_prices or {}).items()])
         await safe_edit_message(query, message, get_main_menu())
-    else: await safe_edit_message(query, f"*{escape_markdown(action.title())}* exchange selected\\. What would you like to do?", get_exchange_actions_menu(action))
+    else:
+        await safe_edit_message(query, f"*{escape_markdown(action.title())}* exchange selected\\. What would you like to do?", get_exchange_actions_menu(action))
 
 @dp.callback_query_handler(lambda c: c.data.startswith("balance_"))
 async def get_balance_handler(query: types.CallbackQuery):
     if not await auth_check(query): return
-    exchange_name = query.data.split("_")[1]; logger.add(f"Fetching balance for {exchange_name}")
+    exchange_name = query.data.split("_", 1)[1]
+    logger.add(f"Fetching balance for {exchange_name}")
     await query.answer(f"Fetching balance from {exchange_name}...")
     msg = await fetch_unified_balance(exchange_name)
     await safe_edit_message(query, msg, get_exchange_actions_menu(exchange_name), send_new_on_fail=True)
@@ -247,10 +360,13 @@ async def get_balance_handler(query: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("positions_"))
 async def get_positions_handler(query: types.CallbackQuery):
     if not await auth_check(query): return
-    exchange_name = query.data.split("_")[1]; logger.add(f"Fetching positions for {exchange_name}")
+    exchange_name = query.data.split("_", 1)[1]
+    logger.add(f"Fetching positions for {exchange_name}")
     await query.answer(f"Fetching open positions from {exchange_name}...")
-    try: await query.message.delete()
-    except Exception: pass
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
     positions = await fetch_positions_list(exchange_name)
     if not positions:
         await bot.send_message(query.from_user.id, f"No open positions found on {escape_markdown(exchange_name)}\\.", reply_markup=get_exchange_actions_menu(exchange_name))
@@ -264,15 +380,32 @@ async def position_actions_handler(query: types.CallbackQuery, state: FSMContext
     if not await auth_check(query): return
     logger.add(f"Position action received: {query.data}")
     try:
-        _, exchange_name, symbol_safe, action_full = query.data.split('__')
+        parts = query.data.split('__')
+        # expected: ["pos", "<exchange>", "<symbol_safe>", "<action_full>"]
+        if len(parts) < 4:
+            raise ValueError("Invalid callback format")
+        _, exchange_name, symbol_safe, action_full = parts[0], parts[1], parts[2], "__".join(parts[3:])
         symbol = symbol_safe.replace('SLASH', '/').replace('COLON', ':')
-        action_parts = action_full.split('_')
-        action = "_".join(action_parts[:-1]) if len(action_parts) > 1 and action_parts[0] == 'set' else action_parts[0]
-        param_str = action_parts[-1] if action_parts[-1].isdigit() else None
+        # Robust parsing for action_full:
+        # possible values: "refresh", "close_25", "close_50", "close_100", "set_tp", "set_sl"
+        if action_full.startswith("set_"):          # set_tp / set_sl
+            action = action_full  # 'set_tp' or 'set_sl'
+            param = None
+        elif action_full.startswith("close_"):
+            action = "close"
+            try:
+                param = int(action_full.split("_", 1)[1])
+            except:
+                param = None
+        elif action_full == "refresh":
+            action = "refresh"; param = None
+        else:
+            action = action_full; param = None
     except Exception as e:
-        logger.add(f"CRITICAL PARSING ERROR: {e} | Data: {query.data}"); return await query.answer("❌ Invalid command", show_alert=True)
-    
-    logger.add(f"Parsed -> Action: {action}, Symbol: {symbol}, Exchange: {exchange_name}, Param: {param_str}")
+        logger.add(f"CRITICAL PARSING ERROR: {e} | Data: {query.data}")
+        return await query.answer("❌ Invalid command", show_alert=True)
+
+    logger.add(f"Parsed -> Action: {action}, Symbol: {symbol}, Exchange: {exchange_name}, Param: {param}")
 
     if action == "refresh":
         await query.answer("🔃 Refreshing...")
@@ -280,23 +413,27 @@ async def position_actions_handler(query: types.CallbackQuery, state: FSMContext
         if positions:
             pos_data = await format_position_message(positions[0], exchange_name)
             await safe_edit_message(query, pos_data['text'], pos_data['keyboard'])
-        else: await safe_edit_message(query, f"Position {escape_markdown(symbol)} is closed\\.")
+        else:
+            await safe_edit_message(query, f"Position {escape_markdown(symbol)} is closed\\.")
         return
 
     if action == "close":
-        percentage = int(param_str)
+        if param is None:
+            return await query.answer("Invalid close parameter", show_alert=True)
+        percentage = param
         await query.answer(f"Sending request to close {percentage}% of position...")
-        
-        exchange_ccxt = await get_exchange(exchange_name) # For precision
-        if not exchange_ccxt: return await query.answer("Exchange not configured.", show_alert=True)
-        
+        # get exchange via ccxt to apply precision
+        exchange_ccxt = await get_exchange(exchange_name)
+        if not exchange_ccxt:
+            return await query.answer("Exchange not configured.", show_alert=True)
+
         positions = await fetch_positions_list(exchange_name, symbol)
-        if not positions: return await safe_edit_message(query, f"Position {escape_markdown(symbol)} is no longer open\\.")
-        
+        if not positions:
+            await exchange_ccxt.close()
+            return await safe_edit_message(query, f"Position {escape_markdown(symbol)} is no longer open\\.")
+
         position = positions[0]
-        amount_to_close = abs(position['contracts']) * (percentage / 100)
-        
-        # Apply precision
+        amount_to_close = abs(position.get('contracts') or position.get('size') or 0) * (percentage / 100)
         try:
             amount_to_close = float(exchange_ccxt.amount_to_precision(symbol, amount_to_close))
         except Exception as e:
@@ -304,9 +441,9 @@ async def position_actions_handler(query: types.CallbackQuery, state: FSMContext
         finally:
             await exchange_ccxt.close()
 
-        side = 'SELL' if position['side'] == 'long' else 'BUY'
+        side = 'SELL' if position.get('side') == 'long' else 'BUY'
         market_symbol = get_market_symbol(symbol)
-        
+
         response = None
         if exchange_name == 'binance':
             payload = {'symbol': market_symbol, 'side': side, 'type': 'MARKET', 'quantity': str(amount_to_close), 'reduceOnly': 'true'}
@@ -317,7 +454,7 @@ async def position_actions_handler(query: types.CallbackQuery, state: FSMContext
         elif exchange_name == 'coinex':
             payload = {'market': market_symbol, 'side': 'sell' if side == 'SELL' else 'buy', 'type': 'market', 'amount': str(amount_to_close)}
             response = await send_signed_request(exchange_name, "POST", "/v2/futures/submit-order", payload)
-        
+
         if response and ((exchange_name == 'binance' and response.get('orderId')) or (exchange_name == 'bybit' and response.get('retCode') == 0) or (exchange_name == 'coinex' and response.get('code') == 0)):
             await safe_edit_message(query, f"✅ Request to close `{escape_markdown(f'{amount_to_close:.4f}')}` of *{escape_markdown(symbol)}* was sent successfully\\.")
         else:
@@ -325,51 +462,70 @@ async def position_actions_handler(query: types.CallbackQuery, state: FSMContext
         return
 
     if action in ["set_tp", "set_sl"]:
-        await (OrderState.SetTP if action == "set_tp" else OrderState.SetSL).set()
+        # Set FSM depending on which one
+        await (OrderState.SetTP.set() if action == "set_tp" else OrderState.SetSL.set())
         await state.update_data(exchange_name=exchange_name, symbol=symbol, original_message_id=query.message.message_id, chat_id=query.message.chat.id)
         prompt_text = "Take Profit (TP)" if action == "set_tp" else "Stop Loss (SL)"
         await query.message.answer(f"Please enter the desired price for *{escape_markdown(prompt_text)}* for position *{escape_markdown(symbol)}*\\.\n\nSend /cancel to abort\\.")
         await query.answer()
+        return
+
+    # Unknown action fallback
+    await query.answer("Unknown action", show_alert=True)
 
 @dp.message_handler(state=[OrderState.SetTP, OrderState.SetSL])
 async def process_price_input(message: types.Message, state: FSMContext):
     logger.add(f"Processing price input: {message.text}")
     try:
         price = float(message.text)
-        user_data = await state.get_data(); current_state = await state.get_state()
-        exchange_name, symbol, msg_id, chat_id = user_data['exchange_name'], user_data['symbol'], user_data['original_message_id'], user_data['chat_id']
-        is_tp = current_state == OrderState.SetTP.state; action_text = "Take Profit" if is_tp else "Stop Loss"
-        
+        user_data = await state.get_data()
+        current_state = await state.get_state()
+        exchange_name = user_data.get('exchange_name')
+        symbol = user_data.get('symbol')
+        msg_id = user_data.get('original_message_id')
+        chat_id = user_data.get('chat_id')
+        is_tp = (current_state == OrderState.SetTP.state)
+        action_text = "Take Profit" if is_tp else "Stop Loss"
+
         positions = await fetch_positions_list(exchange_name, symbol)
-        if not positions: return await message.answer(f"Position *{escape_markdown(symbol)}* is no longer open\\.")
-        
-        position = positions[0]; side = 'SELL' if position['side'] == 'long' else 'BUY'
+        if not positions:
+            return await message.answer(f"Position *{escape_markdown(symbol)}* is no longer open\\.")
+
+        position = positions[0]
+        side = 'SELL' if position.get('side') == 'long' else 'BUY'
         market_symbol = get_market_symbol(symbol)
-        
+
         response = None
         if exchange_name == 'binance':
             order_type = 'TAKE_PROFIT_MARKET' if is_tp else 'STOP_MARKET'
-            payload = {'symbol': market_symbol, 'side': side, 'type': order_type, 'stopPrice': price, 'closePosition': 'true'}
+            payload = {'symbol': market_symbol, 'side': side, 'type': order_type, 'stopPrice': str(price), 'closePosition': 'true'}
             response = await send_signed_request(exchange_name, "POST", "/fapi/v1/order", payload)
         elif exchange_name == 'bybit':
             payload = {'category': 'linear', 'symbol': market_symbol}
-            if is_tp: payload['takeProfit'] = str(price)
-            else: payload['stopLoss'] = str(price)
+            if is_tp:
+                payload['takeProfit'] = str(price)
+            else:
+                payload['stopLoss'] = str(price)
             response = await send_signed_request(exchange_name, "POST", "/v5/position/set-tpsl", payload)
         elif exchange_name == 'coinex':
-            payload = {'market': market_symbol, 'position_id': int(position['info']['position_id'])}
-            if is_tp: payload['take_profit_price'] = str(price)
-            else: payload['stop_loss_price'] = str(price)
+            payload = {'market': market_symbol, 'position_id': int(position.get('info', {}).get('position_id', 0))}
+            if is_tp:
+                payload['take_profit_price'] = str(price)
+            else:
+                payload['stop_loss_price'] = str(price)
             response = await send_signed_request(exchange_name, "POST", "/v2/futures/modify-position-stop", payload)
-        
+
         if response and ((exchange_name == 'binance' and response.get('orderId')) or (exchange_name == 'bybit' and response.get('retCode') == 0) or (exchange_name == 'coinex' and response.get('code') == 0)):
             await message.answer(f"✅ *{escape_markdown(action_text)}* for position *{escape_markdown(symbol)}* was successfully set to `${escape_markdown(price)}`\\.")
             new_positions = await fetch_positions_list(exchange_name, symbol)
             if new_positions:
                 pos_data = await format_position_message(new_positions[0], exchange_name)
-                await bot.edit_message_text(pos_data['text'], chat_id, msg_id, reply_markup=pos_data['keyboard'])
+                try:
+                    await bot.edit_message_text(pos_data['text'], chat_id, msg_id, reply_markup=pos_data['keyboard'])
+                except Exception as e:
+                    logger.add(f"Could not edit position message after setting TP/SL: {e}")
         else:
-             await message.answer(f"❌ Error setting order\\.")
+            await message.answer(f"❌ Error setting order\\.")
     except ValueError:
         await message.answer("❌ Invalid price\\. Please send numbers only\\.")
     except Exception as e:
